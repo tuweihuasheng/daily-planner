@@ -79,9 +79,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # 同步代码到 Gitee 并上传 latest.yml
+  # 需要在仓库 Settings → Secrets 配置 GITEE_TOKEN 后才会实际生效；未配置时不影响 Release
   sync-to-gitee:
     needs: build
     runs-on: ubuntu-latest
+    continue-on-error: true # 未配置 GITEE_TOKEN 时同步失败不阻塞整体结果
     
     steps:
       - name: Checkout code
