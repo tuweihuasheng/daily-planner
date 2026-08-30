@@ -1,0 +1,147 @@
+name: Build and Release (No Signing)
+
+on:
+  push:
+    tags:
+      - 'v*' # 当推送 v 开头的 tag 时触发，如 v1.0.0
+  workflow_dispatch: # 也支持手动触发
+
+jobs:
+  # 构建 Windows 安装包并上传到 GitHub Release
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - name: Get version from package.json
+        id: version
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          echo "Building version: $version"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build Electron app
+        run: pnpm electron:build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.yml
+            dist-electron/*.blockmap
+          retention-days: 1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist-electron/*.exe
+            dist-electron/*.yml
+            dist-electron/*.blockmap
+          body: |
+            ## 每日规划 v${{ steps.version.outputs.VERSION }}
+            
+            ### 下载安装
+            - Windows 用户下载 `daily-planner-setup-${{ steps.version.outputs.VERSION }}.exe`
+            
+            ### 更新说明
+            请查看下方的 commits 记录
+            
+            ---
+            > 作者：严辉村高斯林
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 同步代码到 Gitee 并上传 latest.yml
+  sync-to-gitee:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: ./installer
+
+      - name: Push to Gitee
+        run: |
+          git remote add gitee https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/europe-and-oceania/daily-planner.git
+          git push gitee --all --force
+          git push gitee --tags --force
+          echo "✅ 代码已同步到 Gitee"
+
+      - name: Create Gitee Release
+        id: create_release
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          COMMIT_SHA=$(git rev-parse HEAD)
+          
+          echo "🚀 创建 Gitee Release ${TAG_NAME}..."
+          
+          RELEASE_RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/europe-and-oceania/daily-planner/releases" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"access_token\": \"${{ secrets.GITEE_TOKEN }}\",
+              \"tag_name\": \"${TAG_NAME}\",
+              \"target_commitish\": \"${COMMIT_SHA}\",
+              \"name\": \"每日规划 v${VERSION}\",
+              \"body\": \"## 每日规划 v${VERSION}\\n\\n### 下载安装\\n请下载下方的安装包\\n\\n### 更新说明\\n请查看 [GitHub Releases](https://github.com/tuweihuasheng/daily-planner/releases/tag/${TAG_NAME}) 获取详细更新内容。\\n\\n---\\n> 作者：严辉村高斯林\",
+              \"prerelease\": false
+            }")
+          
+          echo "Release 响应: ${RELEASE_RESPONSE}"
+          
+          RELEASE_ID=$(echo "${RELEASE_RESPONSE}" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          echo "Release ID: ${RELEASE_ID}"
+          echo "release_id=${RELEASE_ID}" >> $GITHUB_OUTPUT
+
+      - name: Upload latest.yml to Gitee
+        env:
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
+        run: |
+          echo "📤 上传 latest.yml 到 Gitee..."
+          
+          # 找到 latest.yml 文件
+          YML_FILE=$(find ./installer -name "latest.yml" | head -1)
+          
+          if [ -n "$YML_FILE" ]; then
+            echo "上传: $(basename $YML_FILE)"
+            curl -s -X POST \
+              "https://gitee.com/api/v5/repos/europe-and-oceania/daily-planner/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${{ secrets.GITEE_TOKEN }}" \
+              -F "file=@${YML_FILE}"
+            echo ""
+            echo "✅ latest.yml 上传完成"
+          else
+            echo "❌ 未找到 latest.yml 文件"
+          fi

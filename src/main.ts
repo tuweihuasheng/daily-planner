@@ -1,0 +1,9752 @@
+/**
+ * 每日规划 - Daily Planner
+ * 
+ * 一款简洁高效的桌面任务管理工具
+ * 支持日历视图、四象限分析、标签分类、农历节假日显示
+ * 
+ * @author 严辉村高斯林
+ * @license MIT
+ * @version 1.6.2
+ */
+
+import './index.css';
+import { Solar, Lunar } from 'lunar-javascript';
+import JSZip from 'jszip';
+
+// ==================== 图片压缩配置 ====================
+const IMAGE_COMPRESSION_CONFIG = {
+  maxWidth: 1920,        // 最大宽度
+  maxHeight: 1080,       // 最大高度
+  quality: 0.7,          // 压缩质量 (0-1)
+  mimeType: 'image/jpeg' // 输出格式
+};
+
+const HOLIDAY_CACHE_VERSION = 'mainland-cn-official-2026-v2';
+
+// ==================== 版本配置 ====================
+const APP_VERSION = '1.7.6';
+const VERSION_CHECK_URL = 'https://your-server.com/api/version'; // 替换为你的版本检查API
+const RELEASE_NOTES: Record<string, string[]> = {
+  '1.7.6': [
+    '🔧 修复自动更新 SHA512 校验失败问题',
+    '🔄 循环日程支持永久循环（生成未来1年任务）',
+    '💾 备忘录数据持久化存储',
+    '📊 任务排序优化：未完成优先级高的在上'
+  ],
+  '1.7.5': [
+    '🔄 循环日程支持永久循环（生成未来1年任务）',
+    '💾 备忘录数据持久化存储',
+    '📊 任务排序优化：未完成优先级高的在上，已完成的在下',
+    '📍 备忘录入口移至左上角',
+    '🗑️ 移除顶部待办提醒铃铛按钮'
+  ],
+  '1.6.8': [
+    '🎨 标签图标改为 SVG 格式',
+    '✨ 新增 150+ 精美 SVG 图标供自定义标签选择',
+    '💡 鼠标悬停标签显示名称提示',
+    '🐛 修复切换日期时标签和知识库不显示的问题',
+    '💄 优化界面标题显示'
+  ],
+  '1.0.0': [
+    '✨ 首次发布',
+    '📅 支持日历视图（月/周/日）',
+    '📝 任务管理与优先级',
+    '🎂 纪念日提醒（支持农历）',
+    '🌙 深色模式',
+    '🎨 多种主题背景'
+  ]
+};
+
+// 类型定义 - 四象限优先级
+type TaskPriority = 'urgent-important' | 'important' | 'urgent' | 'normal';
+
+// 任务排序类型
+type TaskSortBy = 'time' | 'priority' | 'status' | 'text';
+
+// 四象限优先级配置
+const PRIORITY_CONFIG: Record<TaskPriority, { 
+  label: string; 
+  shortLabel: string;
+  desc: string;
+  bgColor: string; 
+  darkBg: string;
+  color: string; 
+  darkColor: string;
+  borderColor: string;
+  order: number;
+}> = {
+  'urgent-important': { 
+    label: '紧急重要', 
+    shortLabel: '紧急重要',
+    desc: '立即处理',
+    bgColor: 'bg-red-100', 
+    darkBg: 'bg-red-900/50', 
+    color: 'text-red-700', 
+    darkColor: 'text-red-300',
+    borderColor: 'border-red-500',
+    order: 0
+  },
+  'important': { 
+    label: '重要不急', 
+    shortLabel: '重要不急',
+    desc: '计划安排',
+    bgColor: 'bg-yellow-100', 
+    darkBg: 'bg-yellow-900/50', 
+    color: 'text-yellow-700', 
+    darkColor: 'text-yellow-300',
+    borderColor: 'border-yellow-500',
+    order: 1
+  },
+  'urgent': { 
+    label: '紧急不重要', 
+    shortLabel: '紧急不重要',
+    desc: '快速处理',
+    bgColor: 'bg-orange-100', 
+    darkBg: 'bg-orange-900/50', 
+    color: 'text-orange-700', 
+    darkColor: 'text-orange-300',
+    borderColor: 'border-orange-500',
+    order: 2
+  },
+  'normal': { 
+    label: '不重要不急', 
+    shortLabel: '不重要不急',
+    desc: '有空处理',
+    bgColor: 'bg-gray-100', 
+    darkBg: 'bg-gray-700', 
+    color: 'text-gray-600', 
+    darkColor: 'text-gray-400',
+    borderColor: 'border-gray-400',
+    order: 3
+  }
+};
+
+// 安全获取优先级配置（兼容旧数据）
+function getPriorityConfig(priority: string | undefined): typeof PRIORITY_CONFIG[TaskPriority] {
+  const validPriorities: TaskPriority[] = ['urgent-important', 'important', 'urgent', 'normal'];
+  const p = priority || 'normal';
+  if (validPriorities.includes(p as TaskPriority)) {
+    return PRIORITY_CONFIG[p as TaskPriority];
+  }
+  return PRIORITY_CONFIG['normal'];
+}
+
+// 解析日期字符串为本地时间（避免 UTC 时区问题）
+function parseLocalDate(dateStr: string): Date {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
+// 通知项类型
+interface NotificationItem {
+  id: string;
+  date: string;
+  taskText: string;
+  taskId: string;
+  dateKey: string;
+  diffDays?: number;  // 距离今天的天数（负数表示逾期）
+}
+
+// 标签类型
+interface Tag {
+  id: string;
+  name: string;
+  color: string;       // Tailwind 背景色
+  textColor: string;   // Tailwind 文字色
+  icon: string;        // emoji 图标
+  isCustom?: boolean;  // 是否是自定义标签
+}
+
+// 知识库步骤
+interface KnowledgeStep {
+  id: string;
+  title: string;        // 步骤标题
+  content: string;      // 步骤内容/操作说明
+  imageUrl?: string;    // 图片URL（可选，兼容旧数据）
+  images?: string[];    // 图片URL数组（支持多图）
+  order: number;        // 排序顺序
+}
+
+// 知识库指南
+interface KnowledgeGuide {
+  id: string;
+  name: string;         // 指南名称
+  steps: KnowledgeStep[];  // 步骤列表
+  createdAt: number;    // 创建时间
+  updatedAt: number;    // 更新时间
+}
+
+// 标签 SVG 图标映射
+const TAG_SVG_ICONS: Record<string, string> = {
+  work: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 7V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v3"/></svg>`,
+  life: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></svg>`,
+  study: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+  health: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>`,
+  finance: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h6M9 15h6"/></svg>`,
+  social: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  travel: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.8 19.2L16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/></svg>`,
+  shopping: `<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>`,
+};
+
+// 获取标签图标 SVG
+function getTagIconSVG(tagId: string, icon?: string): string {
+  // 如果有预定义的 SVG 图标，使用它
+  if (TAG_SVG_ICONS[tagId]) {
+    return TAG_SVG_ICONS[tagId];
+  }
+  // 尝试从 SVG_ICON_CATEGORIES 中获取
+  if (icon) {
+    const svgIcon = getSVGIconById(icon);
+    if (svgIcon) {
+      return `<span class="w-3.5 h-3.5">${svgIcon}</span>`;
+    }
+  }
+  // 如果 icon 本身是 SVG 字符串（旧数据兼容）
+  if (icon && icon.startsWith('<svg')) {
+    return `<span class="w-3.5 h-3.5">${icon}</span>`;
+  }
+  // 默认返回一个标签图标
+  return `<span class="w-3.5 h-3.5"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94.94-2.48 0-3.42L12 2Z"/><circle cx="7" cy="7" r="1.5"/></svg></span>`;
+}
+
+// 预设标签配置
+// 预设标签（用户可自行删除）
+const DEFAULT_TAGS: Tag[] = [
+  { id: 'work', name: '工作', color: 'bg-blue-100', textColor: 'text-blue-700', icon: 'briefcase' },
+  { id: 'life', name: '生活', color: 'bg-green-100', textColor: 'text-green-700', icon: 'home' },
+  { id: 'study', name: '学习', color: 'bg-purple-100', textColor: 'text-purple-700', icon: 'book' },
+  { id: 'health', name: '健康', color: 'bg-red-100', textColor: 'text-red-700', icon: 'heart' },
+  { id: 'finance', name: '财务', color: 'bg-yellow-100', textColor: 'text-yellow-700', icon: 'coin' },
+  { id: 'social', name: '社交', color: 'bg-pink-100', textColor: 'text-pink-700', icon: 'users' },
+  { id: 'travel', name: '出行', color: 'bg-orange-100', textColor: 'text-orange-700', icon: 'plane' },
+  { id: 'shopping', name: '购物', color: 'bg-indigo-100', textColor: 'text-indigo-700', icon: 'cart' },
+];
+
+// SVG 图标定义
+interface SVGIcon {
+  id: string;
+  name: string;
+  svg: string;
+}
+
+// SVG 图标库（按分类组织）
+const SVG_ICON_CATEGORIES: { name: string; icons: SVGIcon[] }[] = [
+  {
+    name: '工作',
+    icons: [
+      { id: 'briefcase', name: '公文包', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v3"/></svg>' },
+      { id: 'folder', name: '文件夹', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' },
+      { id: 'file-text', name: '文档', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>' },
+      { id: 'paperclip', name: '回形针', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>' },
+      { id: 'pin', name: '图钉', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1z"/></svg>' },
+      { id: 'pencil', name: '铅笔', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>' },
+      { id: 'bar-chart', name: '柱状图', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>' },
+      { id: 'trending-up', name: '上升趋势', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="23,6 13.5,15.5 8.5,10.5 1,18"/><polyline points="17,6 23,6 23,12"/></svg>' },
+      { id: 'laptop', name: '笔记本', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="12" rx="2"/><line x1="6" y1="20" x2="18" y2="20"/><line x1="12" y1="16" x2="12" y2="20"/></svg>' },
+      { id: 'monitor', name: '显示器', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>' },
+      { id: 'phone', name: '电话', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>' },
+      { id: 'mail', name: '邮件', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="22,6 12,13 2,6"/></svg>' },
+      { id: 'calendar', name: '日历', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>' },
+      { id: 'clock', name: '时钟', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>' },
+      { id: 'target', name: '目标', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>' },
+    ]
+  },
+  {
+    name: '学习',
+    icons: [
+      { id: 'book-open', name: '打开的书', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>' },
+      { id: 'book', name: '书本', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
+      { id: 'graduation-cap', name: '学士帽', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 10v6M6 12.5V16a6 3 0 0 0 12 0v-3.5"/><path d="M12 2L2 7l10 5 10-5-10-5z"/></svg>' },
+      { id: 'award', name: '奖杯', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/></svg>' },
+      { id: 'medal', name: '奖牌', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7.21 15 2.66 7.14a2 2 0 0 1 .13-2.2L4.4 2.8A2 2 0 0 1 6 2h12a2 2 0 0 1 1.6.8l1.6 2.14a2 2 0 0 1 .14 2.2L16.79 15"/><path d="M12 22a7 7 0 1 0 0-14 7 7 0 0 0 0 14z"/></svg>' },
+      { id: 'search', name: '搜索', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' },
+      { id: 'microscope', name: '显微镜', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 18h8"/><path d="M3 22h18"/><path d="M14 22a7 7 0 1 0 0-14 7 7 0 0 0 0 14z"/><path d="M9 14l3-3"/><circle cx="14" cy="8" r="2"/></svg>' },
+      { id: 'lightbulb', name: '灯泡', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>' },
+      { id: 'brain', name: '大脑', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.54"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.54"/></svg>' },
+      { id: 'pen-tool', name: '笔', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m12 19 7-7 3 3-7 7-3-3z"/><path d="m18 13-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="m2 2 7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>' },
+      { id: 'notebook', name: '笔记本', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h16v16H4z"/><path d="M8 2v4"/><path d="M12 2v4"/><path d="M16 2v4"/><path d="M8 10h8"/><path d="M8 14h8"/></svg>' },
+      { id: 'bookmark', name: '书签', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg>' },
+      { id: 'flag', name: '旗帜', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>' },
+      { id: 'check-circle', name: '完成', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22,4 12,14.01 9,11.01"/></svg>' },
+      { id: 'star', name: '星星', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26 12,2"/></svg>' },
+    ]
+  },
+  {
+    name: '生活',
+    icons: [
+      { id: 'home', name: '房子', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></svg>' },
+      { id: 'building', name: '建筑', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/><path d="M8 6h.01"/><path d="M16 6h.01"/><path d="M12 6h.01"/><path d="M12 10h.01"/><path d="M12 14h.01"/><path d="M16 10h.01"/><path d="M16 14h.01"/><path d="M8 10h.01"/><path d="M8 14h.01"/></svg>' },
+      { id: 'key', name: '钥匙', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>' },
+      { id: 'coffee', name: '咖啡', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 8h1a4 4 0 1 1 0 8h-1"/><path d="M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"/><line x1="6" y1="2" x2="6" y2="4"/><line x1="10" y1="2" x2="10" y2="4"/><line x1="14" y1="2" x2="14" y2="4"/></svg>' },
+      { id: 'utensils', name: '餐具', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2"/><path d="M7 2v20"/><path d="M21 15V2v0a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3Zm0 0v7"/></svg>' },
+      { id: 'wine', name: '红酒', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 22h8"/><path d="M12 11v11"/><path d="M12 15a7 7 0 0 0 7-7c0-2-1-6-7-6s-7 4-7 6a7 7 0 0 0 7 7z"/></svg>' },
+      { id: 'bed', name: '床', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4v16"/><path d="M2 8h18a2 2 0 0 1 2 2v10"/><path d="M2 17h20"/><path d="M6 8v9"/></svg>' },
+      { id: 'bath', name: '浴室', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 6 6.5 3.5a1.5 1.5 0 0 0-1-.5C4.683 3 4 3.683 4 4.5V17a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/><line x1="10" y1="5" x2="8" y2="7"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="7" y1="19" x2="7" y2="21"/><line x1="17" y1="19" x2="17" y2="21"/></svg>' },
+      { id: 'sofa', name: '沙发', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3"/><path d="M2 11v5a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5a2 2 0 0 0-4 0v2H6v-2a2 2 0 0 0-4 0Z"/><path d="M4 18v2"/><path d="M20 18v2"/><path d="M12 4v9"/></svg>' },
+      { id: 'tv', name: '电视', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17,2 12,7 7,2"/></svg>' },
+      { id: 'lamp', name: '台灯', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2h8l4 10H4L8 2Z"/><path d="M12 12v6"/><path d="M8 22v-2c0-1.1.9-2 2-2h4a2 2 0 0 1 2 2v2H8Z"/></svg>' },
+      { id: 'flower', name: '花', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 7.5a4.5 4.5 0 1 1 4.5 4.5M12 7.5A4.5 4.5 0 1 0 7.5 12M12 7.5V9m-4.5 3a4.5 4.5 0 1 0 4.5 4.5M7.5 12H9m3 4.5a4.5 4.5 0 1 0 4.5-4.5M12 16.5V15m4.5-3a4.5 4.5 0 1 0-4.5-4.5M16.5 12H15"/><circle cx="12" cy="12" r="3"/><path d="M12 16.5V22"/><path d="M8 22h8"/></svg>' },
+      { id: 'gift', name: '礼物', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"/></svg>' },
+      { id: 'sun', name: '太阳', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>' },
+      { id: 'moon', name: '月亮', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>' },
+    ]
+  },
+  {
+    name: '健康',
+    icons: [
+      { id: 'heart', name: '心形', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>' },
+      { id: 'activity', name: '活动', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>' },
+      { id: 'dumbbell', name: '哑铃', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m6.5 6.5 11 11"/><path d="m21 21-1-1"/><path d="m3 3 1 1"/><path d="m18 22 4-4"/><path d="m2 6 4-4"/><path d="m3 10 7-7"/><path d="m14 21 7-7"/></svg>' },
+      { id: 'bike', name: '骑行', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="18.5" cy="17.5" r="3.5"/><circle cx="5.5" cy="17.5" r="3.5"/><circle cx="15" cy="5" r="1"/><path d="M12 17.5V14l-3-3 4-3 2 3h2"/></svg>' },
+      { id: 'pill', name: '药丸', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/></svg>' },
+      { id: 'stethoscope', name: '听诊器', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4.8 8.8A3 3 0 0 0 4 11v1a8 8 0 0 0 16 0v-1a3 3 0 0 0-.8-2.2"/><path d="M9 6h.01"/><path d="M15 6h.01"/><path d="M12 6h.01"/><circle cx="19" cy="6" r="3"/></svg>' },
+      { id: 'thermometer', name: '体温计', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg>' },
+      { id: 'bandage', name: '创可贴', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19.5 12.5c2 2 2 5 0 7s-5 2-7 0l-8.5-8.5c-2-2-2-5 0-7s5-2 7 0l8.5 8.5z"/><path d="M9 12l6 6"/><path d="M12 9l6 6"/></svg>' },
+      { id: 'eye', name: '眼睛', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>' },
+      { id: 'apple', name: '苹果', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/><path d="M10 2c1 .5 2 1.5 2 3"/><path d="M12 5V2"/></svg>' },
+      { id: 'salad', name: '沙拉', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 21h10"/><path d="M12 21a9 9 0 0 0 9-9H3a9 9 0 0 0 9 9Z"/><path d="M11.38 12a2.4 2.4 0 0 1-.4-4.77 2.4 2.4 0 0 1 3.2-2.77 2.4 2.4 0 0 1 3.47-.63 2.4 2.4 0 0 1 3.37 3.37 2.4 2.4 0 0 1-1.1 3.7 2.51 2.51 0 0 1 .03 1.1"/><path d="M13 12a2.4 2.4 0 0 0 .4-4.77 2.4 2.4 0 0 0-3.2-2.77 2.4 2.4 0 0 0-3.47-.63 2.4 2.4 0 0 0-3.37 3.37 2.4 2.4 0 0 0 1.1 3.7 2.5 2.5 0 0 0-.03 1.1"/></svg>' },
+      { id: 'running', name: '跑步', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="13" cy="4" r="2"/><path d="M6 20h3l2-6 3-1 2 2 3-1"/><path d="m9 12-1 4"/><path d="M4 17l3-4 2 1"/></svg>' },
+      { id: 'yoga', name: '瑜伽', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="4" r="2"/><path d="M12 6v4"/><path d="M8 10h8"/><path d="m8 14 4 4 4-4"/><path d="M12 18v2"/></svg>' },
+      { id: 'baby', name: '婴儿', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="6" r="3"/><path d="M12 9v3"/><path d="M6 21v-3a6 6 0 1 1 12 0v3"/><circle cx="9" cy="6" r="0.5" fill="currentColor"/><circle cx="15" cy="6" r="0.5" fill="currentColor"/></svg>' },
+      { id: 'bone', name: '骨骼', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 10c.7-.7 1.69 0 2.5 0a2.5 2.5 0 1 0 0-5 .5.5 0 0 0-.5.5 1.5 1.5 0 0 1-3 0 .5.5 0 0 0-.5-.5 2.5 2.5 0 1 0 0 5c.81 0 1.8.7 2.5 0Z"/><path d="M17 14c.7.7 1.69 0 2.5 0a2.5 2.5 0 1 1 0 5 .5.5 0 0 1-.5-.5 1.5 1.5 0 0 0-3 0 .5.5 0 0 1-.5.5 2.5 2.5 0 1 1 0-5c.81 0 1.8-.7 2.5 0Z"/><path d="M7 10c-.7-.7-1.69 0-2.5 0a2.5 2.5 0 1 1 0-5 .5.5 0 0 1 .5.5 1.5 1.5 0 0 0 3 0 .5.5 0 0 1 .5-.5 2.5 2.5 0 1 1 0 5c-.81 0-1.8.7-2.5 0Z"/><path d="M7 14c-.7.7-1.69 0-2.5 0a2.5 2.5 0 1 0 0 5 .5.5 0 0 0 .5-.5 1.5 1.5 0 0 0 3 0 .5.5 0 0 0 .5.5 2.5 2.5 0 1 0 0-5c-.81 0-1.8-.7-2.5 0Z"/><path d="M10 12h4"/></svg>' },
+    ]
+  },
+  {
+    name: '财务',
+    icons: [
+      { id: 'wallet', name: '钱包', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>' },
+      { id: 'credit-card', name: '银行卡', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>' },
+      { id: 'banknote', name: '钞票', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01"/><path d="M18 12h.01"/></svg>' },
+      { id: 'piggy-bank', name: '存钱罐', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 5c-1.5 0-2.8 1.4-3 2-3.5-1.5-11-.3-11 5 0 1.8 0 3 2 4.5V20h4v-2h3v2h4v-3.5c1-.5 2-1.5 2-3.5h2V9c0-1.5-1-4-3-4Z"/><path d="M2 9v1c0 1.1.9 2 2 2"/><path d="M16 11h.01"/></svg>' },
+      { id: 'bitcoin', name: '比特币', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11.767 19.089c4.924.868 6.14-6.025 1.216-6.894m-1.216 6.894L5.86 18.047m5.908 1.042-.347 1.97m1.563-8.864c4.924.869 6.14-6.025 1.215-6.893m-1.215 6.893-3.94-.694m5.155-6.2L8.29 4.26m5.908 1.042.348-1.97M7.48 20.364l3.126-17.727"/></svg>' },
+      { id: 'coin', name: '金币', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M12 6v12"/><path d="M8 10h8"/><path d="M8 14h8"/></svg>' },
+      { id: 'receipt', name: '收据', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1-2-1Z"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 6v12"/></svg>' },
+      { id: 'percent', name: '百分比', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="19" y1="5" x2="5" y2="19"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/></svg>' },
+      { id: 'trending-down', name: '下降', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="23,18 13.5,8.5 8.5,13.5 1,6"/><polyline points="17,18 23,18 23,12"/></svg>' },
+      { id: 'landmark', name: '银行', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="3" y1="22" x2="21" y2="22"/><line x1="6" y1="18" x2="6" y2="11"/><line x1="10" y1="18" x2="10" y2="11"/><line x1="14" y1="18" x2="14" y2="11"/><line x1="18" y1="18" x2="18" y2="11"/><polygon points="12,2 2,7 22,7"/></svg>' },
+      { id: 'diamond', name: '钻石', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.41l7.59 7.59a2.41 2.41 0 0 0 3.41 0l7.59-7.59a2.41 2.41 0 0 0 0-3.41l-7.59-7.59a2.41 2.41 0 0 0-3.41 0Z"/></svg>' },
+      { id: 'hand-coins', name: '存钱', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11 15h7a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-4"/><path d="M9 7h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H5"/><path d="M5 15v4"/><path d="M5 19h4"/><circle cx="12" cy="5" r="2"/></svg>' },
+      { id: 'circle-dollar-sign', name: '美元', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 6v12"/></svg>' },
+      { id: 'line-chart', name: '折线图', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>' },
+      { id: 'calculator', name: '计算器', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="16" y1="14" x2="16" y2="18"/><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/></svg>' },
+    ]
+  },
+  {
+    name: '社交',
+    icons: [
+      { id: 'users', name: '用户组', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' },
+      { id: 'user', name: '用户', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' },
+      { id: 'user-plus', name: '添加用户', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>' },
+      { id: 'message-circle', name: '消息', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>' },
+      { id: 'message-square', name: '对话框', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' },
+      { id: 'at-sign', name: '@符号', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></svg>' },
+      { id: 'handshake', name: '握手', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/></svg>' },
+      { id: 'heart-handshake', name: '爱心握手', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="M12 5 9.04 7.96a2.17 2.17 0 0 0 0 3.08c.82.82 2.13.85 3 .07l2.07-1.9a2.82 2.82 0 0 1 3.79 0l2.96 2.66"/><path d="m18 15-2-2"/><path d="m15 18-2-2"/></svg>' },
+      { id: 'share-2', name: '分享', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>' },
+      { id: 'thumbs-up', name: '点赞', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2h0a3.13 3.13 0 0 1 3 3.88Z"/></svg>' },
+      { id: 'smile', name: '微笑', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>' },
+      { id: 'frown', name: '悲伤', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M16 16s-1.5-2-4-2-4 2-4 2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>' },
+      { id: 'meh', name: '一般', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="8" y1="15" x2="16" y2="15"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>' },
+      { id: 'megaphone', name: '喇叭', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m3 11 18-5v12L3 13v-2z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>' },
+      { id: 'link', name: '链接', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>' },
+    ]
+  },
+  {
+    name: '出行',
+    icons: [
+      { id: 'plane', name: '飞机', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/></svg>' },
+      { id: 'car', name: '汽车', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/></svg>' },
+      { id: 'bus', name: '公交', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 6v6"/><path d="M15 6v6"/><path d="M2 12h19"/><path d="M18 18h-1a1 1 0 0 1-1-1v-1a2 2 0 0 0-2-2h-5a2 2 0 0 0-2 2v1a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-1a2 2 0 0 0-2-2H2"/><path d="M2 16v-3c0-.6.4-1 1-1h18c.6 0 1 .4 1 1v3"/><path d="M3 19h18"/><circle cx="7" cy="19" r="2"/><circle cx="17" cy="19" r="2"/></svg>' },
+      { id: 'train', name: '火车', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="16" rx="2"/><path d="M4 11h16"/><path d="M12 3v8"/><path d="m8 19-2 3"/><path d="m18 22-2-3"/><path d="M8 15h0"/><path d="M16 15h0"/></svg>' },
+      { id: 'bike-icon', name: '自行车', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="18.5" cy="17.5" r="3.5"/><circle cx="5.5" cy="17.5" r="3.5"/><circle cx="15" cy="5" r="1"/><path d="M12 17.5V14l-3-3 4-3 2 3h3"/></svg>' },
+      { id: 'ship', name: '轮船', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 21c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1 .6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M19.38 20A11.6 11.6 0 0 0 21 14l-9-4-9 4c0 2.9.94 5.34 2.81 7.76"/><path d="M19 13V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6"/><path d="M12 10v4"/><path d="M12 2v3"/></svg>' },
+      { id: 'map-pin', name: '地图标记', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>' },
+      { id: 'map', name: '地图', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="3,6 9,3 15,6 21,3 21,18 15,21 9,18 3,21"/><line x1="9" y1="3" x2="9" y2="18"/><line x1="15" y1="6" x2="15" y2="21"/></svg>' },
+      { id: 'compass', name: '指南针', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polygon points="16.24,7.76 14.12,14.12 7.76,16.24 9.88,9.88 16.24,7.76"/></svg>' },
+      { id: 'navigation', name: '导航', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="3,11 22,2 13,21 11,13 3,11"/></svg>' },
+      { id: 'globe', name: '地球', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>' },
+      { id: 'tent', name: '帐篷', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 21 14 3"/><path d="M20.5 21 10 3"/><path d="M15.5 21 12 15l-3.5 6"/><path d="M2 21h20"/></svg>' },
+      { id: 'mountain', name: '山峰', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m8 3 4 8 5-5 5 15H2L8 3z"/></svg>' },
+      { id: 'fuel', name: '加油', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 22h12"/><path d="M5 22V8a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v14"/><path d="M15 12h2a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2h-1"/><path d="M5 2h10v4H5z"/><path d="M18 6h2"/></svg>' },
+      { id: 'ticket', name: '票', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/></svg>' },
+    ]
+  },
+  {
+    name: '购物',
+    icons: [
+      { id: 'shopping-cart', name: '购物车', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>' },
+      { id: 'shopping-bag', name: '购物袋', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>' },
+      { id: 'store', name: '商店', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m2 7 4.41-4.41A2 2 0 0 1 7.83 2h8.34a2 2 0 0 1 1.42.59L22 7"/><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M15 22v-4a2 2 0 0 0-2-2h-2a2 2 0 0 0-2 2v4"/><path d="M2 7h20"/><path d="M22 7v3a2 2 0 0 1-2 2 2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 16 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 12 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 8 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 4 12a2 2 0 0 1-2-2V7"/></svg>' },
+      { id: 'package', name: '包裹', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>' },
+      { id: 'tag', name: '标签', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94.94-2.48 0-3.42L12 2Z"/><path d="M7 7h.01"/></svg>' },
+      { id: 'barcode', name: '条形码', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 5v14"/><path d="M8 5v14"/><path d="M12 5v14"/><path d="M17 5v14"/><path d="M21 5v14"/></svg>' },
+      { id: 'scan', name: '扫描', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>' },
+      { id: 'basket', name: '篮子', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m2 9 3 11h14l3-11"/><path d="M2 9h20"/><path d="M12 3v6"/><path d="m8 6 4-3 4 3"/></svg>' },
+      { id: 'crown', name: '皇冠', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m2 4 3 12h14l3-12-6 7-4-7-4 7-6-7zm3 16h14"/></svg>' },
+      { id: 'sparkles', name: '闪亮', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>' },
+      { id: 'box', name: '盒子', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>' },
+      { id: 'archive', name: '存档', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="5" rx="1"/><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/></svg>' },
+      { id: 'refresh-cw', name: '刷新', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>' },
+      { id: 'undo', name: '撤销', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>' },
+      { id: 'check', name: '勾选', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="20,6 9,17 4,12"/></svg>' },
+    ]
+  },
+  {
+    name: '其他',
+    icons: [
+      { id: 'zap', name: '闪电', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10 13,2"/></svg>' },
+      { id: 'shield', name: '盾牌', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>' },
+      { id: 'lock', name: '锁', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>' },
+      { id: 'unlock', name: '解锁', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>' },
+      { id: 'settings', name: '设置', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>' },
+      { id: 'bell', name: '铃铛', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>' },
+      { id: 'wifi', name: 'WiFi', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>' },
+      { id: 'cloud', name: '云', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>' },
+      { id: 'database', name: '数据库', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>' },
+      { id: 'code', name: '代码', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="16,18 22,12 16,6"/><polyline points="8,6 2,12 8,18"/></svg>' },
+      { id: 'terminal', name: '终端', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4,17 10,11 4,5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>' },
+      { id: 'camera', name: '相机', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' },
+      { id: 'music', name: '音乐', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>' },
+      { id: 'palette', name: '调色板', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="13.5" cy="6.5" r="0.5" fill="currentColor"/><circle cx="17.5" cy="10.5" r="0.5" fill="currentColor"/><circle cx="8.5" cy="7.5" r="0.5" fill="currentColor"/><circle cx="6.5" cy="12.5" r="0.5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.555C21.965 6.012 17.461 2 12 2z"/></svg>' },
+      { id: 'puzzle', name: '拼图', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/></svg>' },
+      { id: 'rocket', name: '火箭', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>' },
+    ]
+  }
+];
+
+// 获取 SVG 图标字符串
+function getSVGIconById(iconId: string): string {
+  for (const category of SVG_ICON_CATEGORIES) {
+    const icon = category.icons.find(i => i.id === iconId);
+    if (icon) {
+      return icon.svg;
+    }
+  }
+  return '';
+}
+
+// 可选图标列表（兼容旧代码，已废弃）
+const ICON_OPTIONS: string[] = [
+  // 工作相关
+  '💼', '📁', '📋', '📝', '📌', '📎', '✏️', '📊', '📈', '📉',
+  '💻', '🖥️', '⌨️', '🖱️', '🖨️', '📱', '☎️', '📧', '📬', '📮',
+  // 学习相关
+  '📚', '📖', '📕', '📗', '📘', '📙', '📓', '📔', '📒', '✏️',
+  '🎓', '🎯', '🏆', '🥇', '🏅', '🎖️', '🔍', '🔬', '🔭', '💡',
+  // 生活相关
+  '🏠', '🏡', '🏢', '🏗️', '🔑', '🛋️', '🛏️', '🚿', '🧹', '🧺',
+  '🍳', '🍽️', '☕', '🍵', '🥤', '🍷', '🍺', '🥘', '🍲', '🥗',
+  // 健康相关
+  '💪', '🏃', '🧘', '⚽', '🏀', '🎾', '🏐', '🎱', '🏓', '🏸',
+  '❤️', '💊', '🏥', '🩺', '💉', '🩹', '🦷', '👁️', '🧠', '🦴',
+  // 财务相关
+  '💰', '💵', '💴', '💶', '💷', '💸', '💳', '🧾', '📊', '📈',
+  '🏦', '🏧', '💎', '🎁', '🧧', '💷', '💰', '💲', '💹', '🔢',
+  // 社交相关
+  '👥', '👤', '🤝', '💬', '💭', '🗣️', '📢', '📣', '📞', '📱',
+  '👨‍👩‍👧', '👨‍👩‍👧‍👦', '👴', '👵', '👶', '🧒', '👦', '👧', '🧑', '👨',
+  // 出行相关
+  '✈️', '🚀', '🚁', '🚂', '🚃', '🚄', '🚅', '🚆', '🚇', '🚈',
+  '🚗', '🚕', '🚙', '🚌', '🚎', '🏎️', '🚓', '🚑', '🚒', '🚐',
+  // 购物相关
+  '🛒', '🛍️', '🛐', '🏪', '🏬', '🏭', '🏷️', '🎫', '🎁', '🎀',
+  '🛍️', '🛒', '💸', '💳', '🧾', '📦', '📬', '📮', '🛍️', '🎁',
+  // 娱乐相关
+  '🎮', '🎯', '🎲', '♟️', '🎨', '🎬', '🎤', '🎧', '🎸', '🎹',
+  '🎺', '🎻', '🥁', '📻', '🎛️', '🎚️', '🎤', '🎼', '🎵', '🎶',
+  // 自然相关
+  '🌟', '⭐', '🌙', '☀️', '🌤️', '⛅', '🌈', '🌸', '🌺', '🌻',
+  '🍀', '🌿', '🍃', '🌾', '🌵', '🌴', '🌳', '🌲', '🍁', '🍂',
+  // 其他
+  '⭐', '✨', '💫', '🔥', '💥', '💢', '💦', '💨', '🎉', '🎊',
+  '🔔', '🔕', '💡', '🕯️', '🔦', '🔋', '🔌', '⚙️', '🔧', '🔨'
+];
+
+interface Task {
+  id: string;
+  text: string;
+  completed: boolean;
+  date: string;
+  time: string;
+  priority: TaskPriority;
+  tags: string[];  // 标签ID数组
+  guideId?: string; // 关联的知识库ID
+  recurringScheduleId?: string;  // 关联的循环日程ID
+}
+
+interface DateTasks {
+  [date: string]: Task[];
+}
+
+interface Anniversary {
+  id: string;
+  name: string;
+  month: number;  // 1-12
+  day: number;    // 1-31
+  type: 'birthday' | 'anniversary' | 'custom';
+  isLunar?: boolean;  // 是否是农历日期
+}
+
+// 循环日程类型
+type RecurrenceType = 'weekly' | 'monthly';
+
+// 循环日程接口
+interface RecurringSchedule {
+  id: string;
+  name: string;              // 日程名称
+  time: string;              // 提醒时间 HH:mm
+  recurrenceType: RecurrenceType;  // 循环类型：按周/按月
+  weekdays?: number[];       // 按周循环：选中的星期几 (0=周日, 1=周一, ..., 6=周六)
+  monthDay?: number;         // 按月循环：每月几号 (1-31)
+  createdAt: string;         // 创建时间
+  startDate: string;         // 开始日期 YYYY-MM-DD
+}
+
+interface MonthlyStats {
+  total: number;
+  completed: number;
+  pending: number;
+  percentage: number;
+}
+
+// 周统计数据
+interface WeeklyStats {
+  total: number;
+  completed: number;
+  pending: number;
+  percentage: number;
+  byDay: { date: string; dayName: string; total: number; completed: number }[];
+  lastWeekPercentage: number;
+  improvement: number; // 较上周提升百分比
+  streakDays: number; // 连续打卡天数
+}
+
+// 年度统计数据扩展
+interface YearlyStatsExtended {
+  total: number;
+  completed: number;
+  pending: number;
+  percentage: number;
+  byMonth: { month: number; total: number; completed: number; percentage: number }[];
+  busiestMonth: { month: number; count: number } | null;
+  mostProductiveMonth: { month: number; rate: number } | null;
+  streakDays: number;
+  longestStreak: number;
+  avgDailyTasks: number;
+}
+
+type MonthlyFilter = 'all' | 'completed' | 'pending';
+
+// 视图模式类型
+type ViewMode = 'month' | 'week';
+
+// 主题模式类型
+type ThemeMode = 'light' | 'dark';
+
+// 背景主题类型
+type BackgroundTheme = 'blue' | 'purple' | 'green' | 'orange' | 'pink';
+
+// 节假日信息类型
+interface HolidayInfo {
+  date: string;
+  name: string;
+  holiday: boolean;  // true=假日, false=工作日(调休)
+  wage: number;      // 工资倍数：3=法定假日, 1=普通工作日
+}
+
+interface HolidayCache {
+  [year: string]: {
+    [date: string]: HolidayInfo;
+  };
+}
+
+// 背景主题配置
+const backgroundThemes: Record<BackgroundTheme, { from: string; to: string; name: string; darkFrom: string; darkTo: string }> = {
+  blue: { from: 'from-blue-100', to: 'to-indigo-200', name: '蓝色', darkFrom: 'from-gray-900', darkTo: 'to-slate-900' },
+  purple: { from: 'from-purple-100', to: 'to-pink-200', name: '紫色', darkFrom: 'from-gray-900', darkTo: 'to-purple-950' },
+  green: { from: 'from-green-100', to: 'to-emerald-200', name: '绿色', darkFrom: 'from-gray-900', darkTo: 'to-emerald-950' },
+  orange: { from: 'from-orange-100', to: 'to-amber-200', name: '橙色', darkFrom: 'from-gray-900', darkTo: 'to-amber-950' },
+  pink: { from: 'from-pink-100', to: 'to-rose-200', name: '粉色', darkFrom: 'from-gray-900', darkTo: 'to-rose-950' }
+};
+
+// 应用状态
+class DailyPlanner {
+  private currentDate: Date;
+  private selectedDate: Date | null;
+  private hoveredDate: Date | null;
+  private tasks: DateTasks;
+  private anniversaries: Anniversary[];
+  private monthlyFilter: MonthlyFilter;
+  private showStatsModal: boolean;
+  private showYearlyStats: boolean = false;  // 是否显示年度统计
+  private showWeeklySummary: boolean = false;  // 是否显示周总结
+  private showMonthlySummary: boolean = false;  // 是否显示月总结
+  // 总结导航偏移量（用于查看历史周期）
+  private viewingWeekOffset: number = 0;   // 0=当前周，-1=上周，1=下周
+  private viewingMonthOffset: number = 0;  // 0=当前月，-1=上月，1=下月
+  private viewingYearOffset: number = 0;   // 0=当前年，-1=去年，1=明年
+  // 总结文字存储（按年-周/年-月/年 格式存储）
+  private summaryNotes: {
+    weekly: Record<string, string>;   // key: "2024-W01" 格式
+    monthly: Record<string, string>;  // key: "2024-01" 格式
+    yearly: Record<string, string>;   // key: "2024" 格式
+  } = { weekly: {}, monthly: {}, yearly: {} };
+  private showQuadrantView: boolean = false;  // 是否显示四象限视图
+  private quadrantFilter: 'year' | 'month' | 'custom' = 'month';  // 四象限时间筛选
+  private quadrantStartDate: string = '';  // 自定义开始日期
+  private quadrantEndDate: string = '';  // 自定义结束日期
+  private hoverTimer: number | null = null;
+  private currentTheme: BackgroundTheme = 'blue';
+  private themeMode: ThemeMode = 'light';
+  private showThemeMenu: boolean = false;
+  private showCopyModal: boolean = false;
+  private copyingTask: Task | null = null;
+  private selectedCopyDates: Set<string> = new Set();
+  private holidayCache: HolidayCache = {};  // 节假日缓存
+  private viewMode: ViewMode = 'month';  // 视图模式
+  private searchQuery: string = '';  // 搜索关键词
+  private showSearchPanel: boolean = false;  // 显示搜索面板
+  private showReminderSettings: boolean = false;  // 显示提醒设置弹窗
+  private showShortcutHelp: boolean = false;  // 显示快捷键帮助弹窗
+  private showContactInfo: boolean = false;  // 显示联系作者弹窗
+  private showMonthPicker: boolean = false;  // 显示月份选择器
+  private yearRangeOffset: number = 0;  // 年份选择器偏移量
+  private selectedPickerYear: number = 0;  // 月份选择器中选中的年份
+  private customTags: Tag[] = [];  // 自定义标签
+  private selectedTagFilter: string = '';  // 标签筛选（空=全部）
+  private showTagManager: boolean = false;  // 显示标签管理弹窗
+  private selectedTagsForTask: Set<string> = new Set();  // 添加任务时选中的标签
+  private tagOrder: string[] = [];  // 标签排序（存储标签ID顺序）
+  private deletedDefaultTagIds: Set<string> = new Set();  // 已删除的预设标签ID
+  private draggedTagId: string = '';  // 正在拖动的标签ID
+  private showIconPicker: boolean = false;  // 显示图标选择器
+  private selectedIcon: string = '🏷️';  // 选中的图标
+  private showTaskPanel: boolean = false;  // 显示任务面板
+  private preselectedTime: string = '';  // 预选时间（用于周视图点击时间格子）
+  private guideSearchKeyword: string = '';  // 知识库搜索关键词（任务面板）
+  private showGuideDropdown: boolean = false;  // 显示知识库下拉
+  private selectedGuideId: string = '';  // 选中的知识库ID
+  
+  // 知识库相关
+  private showKnowledgeBase: boolean = false;  // 显示知识库
+  private knowledgeGuides: KnowledgeGuide[] = [];  // 所有指南
+  private currentGuide: KnowledgeGuide | null = null;  // 当前编辑/查看的指南
+  private editingGuideId: string = '';  // 正在编辑的指南ID
+  private viewingGuideId: string = '';  // 正在查看的指南ID（只读模式）
+  private knowledgeSearchKeyword: string = '';  // 知识库搜索关键词
+  private showGuideSaveConfirm: boolean = false;  // 显示指南保存确认弹窗
+  
+  // 循环日程相关
+  private recurringSchedules: RecurringSchedule[] = [];  // 所有循环日程
+  private showRecurringScheduleModal: boolean = false;  // 显示循环日程弹窗
+  private editingRecurringSchedule: RecurringSchedule | null = null;  // 正在编辑的循环日程
+  
+  // 备忘录相关
+  private memos: string[] = [];  // 备忘录列表
+  private showMemoPanel: boolean = false;  // 显示备忘录面板
+  private editingMemoIndex: number = -1;  // 正在编辑的备忘录索引
+  private memoSearchKeyword: string = '';  // 备忘录搜索关键词
+  private memoPanelCloseTimer: ReturnType<typeof setTimeout> | null = null;  // 关闭定时器
+  
+  // 提醒配置
+  private reminderConfig = {
+    anniversary: 3,   // 纪念日提前3天
+    high: 7,          // 高优先级提前7天
+    medium: 5,        // 中优先级提前5天
+    low: 3            // 低优先级提前3天
+  };
+
+  // 任务排序配置
+  private taskSortBy: TaskSortBy = 'priority';
+  
+  // 日期自动更新
+  private lastCheckedDate: string = '';  // 上次检查的日期字符串
+  private dateCheckInterval: ReturnType<typeof setInterval> | null = null;  // 定时器ID
+
+  constructor() {
+    this.currentDate = new Date();
+    this.selectedDate = null;
+    this.hoveredDate = null;
+    this.tasks = this.loadTasks();
+    this.anniversaries = this.loadAnniversaries();
+    this.customTags = this.loadCustomTags();  // 加载自定义标签
+    this.tagOrder = this.loadTagOrder();  // 加载标签排序
+    this.deletedDefaultTagIds = new Set(this.loadDeletedDefaultTagIds());  // 加载已删除的预设标签
+    this.summaryNotes = this.loadSummaryNotes();  // 加载总结文字
+    this.knowledgeGuides = [];  // 初始化为空，稍后异步加载
+    this.monthlyFilter = 'all';
+    this.showStatsModal = false;
+    this.currentTheme = this.loadTheme();
+    this.themeMode = this.loadThemeMode();
+    this.viewMode = this.loadViewMode();
+    this.taskSortBy = this.loadTaskSortBy();
+    this.holidayCache = this.loadHolidayCache();
+    this.loadHolidaysForYear(this.currentDate.getFullYear());
+    this.applyThemeMode();
+    this.loadNotificationState();  // 加载通知状态
+    this.initElectronAPI();
+    this.initPasteListener();  // 初始化粘贴监听（用于截图）
+    this.startDateAutoUpdate();  // 启动日期自动更新
+    this.render();
+    // 异步加载知识库
+    this.initKnowledgeGuides();
+    // 加载循环日程
+    this.recurringSchedules = this.loadRecurringSchedules();
+    // 补充生成循环日程任务（支持永久循环）
+    this.regenerateRecurringTasks();
+    // 异步加载备忘录（优先使用 Electron 文件存储）
+    this.initMemos();
+  }
+  
+  // 异步初始化知识库
+  private async initKnowledgeGuides(): Promise<void> {
+    this.knowledgeGuides = await this.loadKnowledgeGuides();
+    this.render();
+  }
+
+  // 异步初始化备忘录
+  private async initMemos(): Promise<void> {
+    this.memos = await this.loadMemosAsync();
+    this.render();
+  }
+
+  // 加载任务排序配置
+  private loadTaskSortBy(): TaskSortBy {
+    const saved = localStorage.getItem('dailyPlannerTaskSortBy');
+    return saved ? saved as TaskSortBy : 'priority';
+  }
+
+  // 初始化粘贴监听器（用于截图功能）
+  private initPasteListener(): void {
+    // 监听粘贴事件
+    document.addEventListener('paste', (e) => {
+      // 只有在编辑指南时才处理粘贴
+      if (this.showKnowledgeBase && this.currentGuide) {
+        // 如果有指定步骤ID，粘贴到指定步骤
+        if (this.screenshotStepId) {
+          this.handlePaste(e);
+        } else {
+          // 否则粘贴到当前活动的步骤（最后一个步骤或焦点的步骤）
+          this.handlePasteToActiveStep(e);
+        }
+      }
+    });
+    
+    // 监听Ctrl+B快捷键（真正的截图功能）
+    document.addEventListener('keydown', (e) => {
+      // Ctrl+B 或 Cmd+B（Mac）
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        // 只有在编辑指南时才触发
+        if (this.showKnowledgeBase && this.currentGuide) {
+          e.preventDefault();
+          // 调用真正的截图功能
+          this.startRealScreenshot();
+        }
+      }
+    });
+    
+    // 监听截图完成事件
+    if (window.electronAPI) {
+      window.electronAPI.onCompleteScreenshot((data) => {
+        if (data.success && data.imageData) {
+          // 如果有指定步骤ID，保存到指定步骤
+          if (this.screenshotStepId) {
+            this.updateStepImage(this.screenshotStepId, data.imageData);
+            this.screenshotStepId = '';
+          } else {
+            // 否则保存到当前活动的步骤
+            const activeStepId = this.getActiveStepId();
+            if (activeStepId) {
+              this.updateStepImage(activeStepId, data.imageData);
+            }
+          }
+        }
+      });
+    }
+  }
+
+  // 启动真正的截图功能
+  private async startRealScreenshot(): Promise<void> {
+    // 检查是否在 Electron 环境中
+    const isElectron = typeof window !== 'undefined' && 
+                       typeof (window as any).process !== 'undefined' && 
+                       (window as any).process.type === 'renderer';
+    
+    if (!window.electronAPI) {
+      // 不在 Electron 环境中，提示用户使用替代方案
+      this.showScreenshotFallbackTip();
+      return;
+    }
+    
+    try {
+      const result = await window.electronAPI.startScreenshot();
+      if (!result.success) {
+        console.error('截图失败:', result.error);
+        this.showScreenshotFallbackTip();
+      }
+    } catch (err) {
+      console.error('启动截图失败:', err);
+      this.showScreenshotFallbackTip();
+    }
+  }
+
+  // 显示截图替代方案提示
+  private showScreenshotFallbackTip(): void {
+    // 创建提示弹窗
+    const modal = document.createElement('div');
+    modal.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+      <div class="bg-white dark:bg-gray-800 rounded-xl p-6 max-w-md mx-4 shadow-2xl">
+        <div class="flex items-center gap-3 mb-4">
+          <span class="text-2xl">📸</span>
+          <h3 class="text-lg font-semibold text-gray-800 dark:text-white">截图提示</h3>
+        </div>
+        <div class="space-y-3 text-gray-600 dark:text-gray-300">
+          <p>截图功能需要在<strong>桌面版应用</strong>中使用。</p>
+          <div class="bg-gray-100 dark:bg-gray-700 rounded-lg p-4 space-y-2">
+            <p class="text-sm font-medium">📌 临时替代方案：</p>
+            <ol class="text-sm list-decimal list-inside space-y-1">
+              <li>按 <kbd class="px-2 py-0.5 bg-gray-200 dark:bg-gray-600 rounded">Win+Shift+S</kbd> 截图</li>
+              <li>截图会自动复制到剪贴板</li>
+              <li>点击 <strong>"上传图片"</strong> 按钮粘贴</li>
+            </ol>
+          </div>
+        </div>
+        <button onclick="this.closest('.fixed').remove()" 
+                class="mt-4 w-full py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-lg transition-colors">
+          我知道了
+        </button>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    
+    // 点击背景关闭
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.remove();
+    });
+  }
+
+  // 从剪贴板读取图片到指定步骤
+  private async readClipboardImage(): Promise<void> {
+    try {
+      const clipboardItems = await navigator.clipboard.read();
+      for (const item of clipboardItems) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            const blob = await item.getType(type);
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              const base64 = e.target?.result as string;
+              this.updateStepImage(this.screenshotStepId, base64);
+              this.screenshotStepId = '';
+            };
+            reader.readAsDataURL(blob);
+            return;
+          }
+        }
+      }
+      // 如果没有图片，提示用户
+      console.log('剪贴板中没有图片');
+    } catch (err) {
+      console.log('读取剪贴板失败，请尝试Ctrl+V粘贴:', err);
+    }
+  }
+
+  // 获取当前活动的步骤ID（优先使用聚焦的步骤，否则返回最后一个步骤）
+  private getActiveStepId(): string {
+    if (!this.currentGuide || this.currentGuide.steps.length === 0) {
+      return '';
+    }
+    // 如果有聚焦的步骤，返回它
+    if (this.focusedStepId) {
+      const stepExists = this.currentGuide.steps.some(s => s.id === this.focusedStepId);
+      if (stepExists) {
+        return this.focusedStepId;
+      }
+    }
+    // 否则返回最后一个步骤的ID
+    return this.currentGuide.steps[this.currentGuide.steps.length - 1].id;
+  }
+  
+  // 设置当前聚焦的步骤
+  public setFocusedStep(stepId: string): void {
+    this.focusedStepId = stepId;
+  }
+
+  // 从剪贴板读取图片到当前活动的步骤
+  private async readClipboardToActiveStep(): Promise<void> {
+    const activeStepId = this.getActiveStepId();
+    if (!activeStepId) {
+      console.log('没有可用的步骤');
+      return;
+    }
+    
+    try {
+      const clipboardItems = await navigator.clipboard.read();
+      for (const item of clipboardItems) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            const blob = await item.getType(type);
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              const base64 = e.target?.result as string;
+              this.updateStepImage(activeStepId, base64);
+            };
+            reader.readAsDataURL(blob);
+            return;
+          }
+        }
+      }
+      console.log('剪贴板中没有图片');
+    } catch (err) {
+      console.log('读取剪贴板失败:', err);
+    }
+  }
+
+  // 处理粘贴到当前活动的步骤
+  private handlePasteToActiveStep(event: ClipboardEvent): void {
+    const activeStepId = this.getActiveStepId();
+    if (!activeStepId) return;
+    
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile();
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const base64 = e.target?.result as string;
+            this.updateStepImage(activeStepId, base64);
+          };
+          reader.readAsDataURL(file);
+        }
+        break;
+      }
+    }
+  }
+
+  // 启动日期自动更新（每分钟检查一次）
+  private startDateAutoUpdate(): void {
+    this.lastCheckedDate = this.formatDate(new Date());
+    
+    // 每分钟检查一次日期是否变化
+    this.dateCheckInterval = setInterval(() => {
+      this.checkDateChange();
+    }, 60000); // 60秒检查一次
+  }
+
+  // 检查日期是否变化
+  private checkDateChange(): void {
+    const today = new Date();
+    const todayStr = this.formatDate(today);
+    
+    // 如果日期变化了
+    if (todayStr !== this.lastCheckedDate) {
+      console.log('[日期更新] 检测到日期变化:', this.lastCheckedDate, '->', todayStr);
+      
+      // 更新记录的日期
+      this.lastCheckedDate = todayStr;
+      
+      // 更新当前月份视图
+      const oldMonth = this.currentDate.getMonth();
+      const oldYear = this.currentDate.getFullYear();
+      const newMonth = today.getMonth();
+      const newYear = today.getFullYear();
+      
+      // 如果月份或年份变化，需要重新加载节假日数据
+      if (oldMonth !== newMonth || oldYear !== newYear) {
+        this.loadHolidaysForYear(newYear);
+      }
+      
+      // 更新当前日期到新的一天的月份
+      this.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+      
+      // 如果当前选中的是昨天的日期，自动切换到今天
+      if (this.selectedDate) {
+        const selectedStr = this.formatDate(this.selectedDate);
+        if (selectedStr !== todayStr) {
+          this.selectedDate = new Date(today);
+        }
+      }
+      
+      // 重新渲染界面
+      this.render();
+      
+      // 显示通知
+      this.showDateChangeNotification(today);
+    }
+  }
+
+  // 显示日期变化通知
+  private showDateChangeNotification(newDate: Date): void {
+    const dateStr = this.formatDate(newDate);
+    const lunarText = this.getLunarFullText(newDate);
+    
+    // 使用 Electron 的通知功能（如果可用）
+    if (window.electronAPI?.sendNotification) {
+      window.electronAPI.sendNotification(
+        '新的一天开始了！',
+        `今天是 ${dateStr}，农历 ${lunarText}`
+      );
+    }
+  }
+
+  // 停止日期自动更新（清理定时器）
+  private stopDateAutoUpdate(): void {
+    if (this.dateCheckInterval) {
+      clearInterval(this.dateCheckInterval);
+      this.dateCheckInterval = null;
+    }
+  }
+
+  // 保存任务排序配置
+  private saveTaskSortBy(sortBy: TaskSortBy): void {
+    localStorage.setItem('dailyPlannerTaskSortBy', sortBy);
+  }
+
+  // ==================== 标签相关方法 ====================
+
+  // 加载自定义标签
+  private loadCustomTags(): Tag[] {
+    const saved = localStorage.getItem('dailyPlannerCustomTags');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存自定义标签
+  private saveCustomTags(): void {
+    localStorage.setItem('dailyPlannerCustomTags', JSON.stringify(this.customTags));
+  }
+
+  // 加载标签排序
+  private loadTagOrder(): string[] {
+    const saved = localStorage.getItem('dailyPlannerTagOrder');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存标签排序
+  private saveTagOrder(): void {
+    localStorage.setItem('dailyPlannerTagOrder', JSON.stringify(this.tagOrder));
+  }
+
+  // 加载已删除的预设标签ID
+  private loadDeletedDefaultTagIds(): string[] {
+    const saved = localStorage.getItem('dailyPlannerDeletedDefaultTags');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存已删除的预设标签ID
+  private saveDeletedDefaultTagIds(): void {
+    localStorage.setItem('dailyPlannerDeletedDefaultTags', JSON.stringify([...this.deletedDefaultTagIds]));
+  }
+
+  // 获取所有标签（预设 + 自定义），按排序排列，过滤已删除的预设标签
+  private getAllTags(): Tag[] {
+    // 过滤掉已删除的预设标签
+    const availableDefaultTags = DEFAULT_TAGS.filter(t => !this.deletedDefaultTagIds.has(t.id));
+    const allTags = [...availableDefaultTags, ...this.customTags];
+    
+    // 如果有自定义排序，按排序排列
+    if (this.tagOrder.length > 0) {
+      const orderedTags: Tag[] = [];
+      const tagMap = new Map(allTags.map(t => [t.id, t]));
+      
+      // 先按排序顺序添加
+      this.tagOrder.forEach(id => {
+        const tag = tagMap.get(id);
+        if (tag) {
+          orderedTags.push(tag);
+          tagMap.delete(id);
+        }
+      });
+      
+      // 再添加未在排序中的标签
+      tagMap.forEach(tag => orderedTags.push(tag));
+      
+      return orderedTags;
+    }
+    
+    return allTags;
+  }
+
+  // 根据ID获取标签
+  private getTagById(id: string): Tag | undefined {
+    return this.getAllTags().find(t => t.id === id);
+  }
+
+  // 开始拖动标签
+  private onTagDragStart(event: DragEvent, tagId: string): void {
+    event.stopPropagation(); // 阻止事件冒泡，防止触发弹窗关闭
+    event.dataTransfer!.effectAllowed = 'move';
+    event.dataTransfer!.setData('text/plain', tagId);
+    this.draggedTagId = tagId;
+  }
+
+  // 拖动标签到目标位置
+  private onTagDrop(event: DragEvent, targetTagId: string): void {
+    event.stopPropagation(); // 阻止事件冒泡
+    event.preventDefault(); // 阻止默认行为
+    
+    if (!this.draggedTagId || this.draggedTagId === targetTagId) {
+      this.draggedTagId = '';
+      return;
+    }
+    
+    // 获取所有标签
+    const allTags = this.getAllTags();
+    
+    // 如果没有排序，初始化为当前顺序
+    if (this.tagOrder.length === 0) {
+      this.tagOrder = allTags.map(t => t.id);
+    }
+    
+    // 找到拖动标签和目标标签的位置
+    const draggedIndex = this.tagOrder.indexOf(this.draggedTagId);
+    const targetIndex = this.tagOrder.indexOf(targetTagId);
+    
+    if (draggedIndex >= 0 && targetIndex >= 0) {
+      // 从原位置移除
+      this.tagOrder.splice(draggedIndex, 1);
+      // 插入到目标位置
+      this.tagOrder.splice(targetIndex, 0, this.draggedTagId);
+      this.saveTagOrder();
+    }
+    
+    this.draggedTagId = '';
+    this.render();
+  }
+
+  // 添加自定义标签
+  private addCustomTag(name: string, color: string, icon: string): void {
+    const id = 'custom-' + Date.now();
+    this.customTags.push({
+      id,
+      name,
+      color,
+      textColor: this.getTextColorForBg(color),
+      icon,
+      isCustom: true
+    });
+    this.saveCustomTags();
+    this.render();
+  }
+
+  // 删除自定义标签
+  private deleteCustomTag(id: string): void {
+    this.customTags = this.customTags.filter(t => t.id !== id);
+    this.saveCustomTags();
+    // 从所有任务中移除该标签
+    Object.keys(this.tasks).forEach(date => {
+      this.tasks[date].forEach(task => {
+        if (task.tags) {
+          task.tags = task.tags.filter(tid => tid !== id);
+        }
+      });
+    });
+    this.saveTasks();
+    this.render();
+  }
+
+  // 删除任意标签（预设或自定义）
+  private deleteTag(id: string): void {
+    // 检查是否是预设标签
+    const isDefaultTag = DEFAULT_TAGS.some(t => t.id === id);
+    
+    if (isDefaultTag) {
+      // 删除预设标签：添加到已删除列表
+      this.deletedDefaultTagIds.add(id);
+      this.saveDeletedDefaultTagIds();
+    } else {
+      // 删除自定义标签
+      this.deleteCustomTag(id);
+      return;
+    }
+    
+    // 从标签排序中移除
+    this.tagOrder = this.tagOrder.filter(tid => tid !== id);
+    this.saveTagOrder();
+    
+    // 从所有任务中移除该标签
+    Object.keys(this.tasks).forEach(date => {
+      this.tasks[date].forEach(task => {
+        if (task.tags) {
+          task.tags = task.tags.filter(tid => tid !== id);
+        }
+      });
+    });
+    this.saveTasks();
+    this.render();
+  }
+
+  // 根据背景色获取文字色
+  private getTextColorForBg(bgColor: string): string {
+    const colorMap: Record<string, string> = {
+      'bg-blue-100': 'text-blue-700',
+      'bg-green-100': 'text-green-700',
+      'bg-purple-100': 'text-purple-700',
+      'bg-red-100': 'text-red-700',
+      'bg-yellow-100': 'text-yellow-700',
+      'bg-pink-100': 'text-pink-700',
+      'bg-orange-100': 'text-orange-700',
+      'bg-indigo-100': 'text-indigo-700',
+      'bg-cyan-100': 'text-cyan-700',
+      'bg-teal-100': 'text-teal-700',
+    };
+    return colorMap[bgColor] || 'text-gray-700';
+  }
+
+  // 切换标签筛选
+  private toggleTagFilter(tagId: string): void {
+    this.selectedTagFilter = this.selectedTagFilter === tagId ? '' : tagId;
+    this.render();
+  }
+
+  // 切换标签管理弹窗
+  private toggleTagManager(): void {
+    this.showTagManager = !this.showTagManager;
+    this.showIconPicker = false;  // 关闭图标选择器
+    this.render();
+  }
+
+  // 切换图标选择器
+  private toggleIconPicker(): void {
+    this.showIconPicker = !this.showIconPicker;
+    this.render();
+  }
+
+  // 选择图标
+  private selectIcon(icon: string): void {
+    this.selectedIcon = icon;
+    this.showIconPicker = false;
+    // 更新隐藏输入框的值
+    const iconInput = document.getElementById('newTagIcon') as HTMLInputElement;
+    if (iconInput) iconInput.value = icon;
+    // 更新显示的图标
+    const display = document.getElementById('selectedIconDisplay');
+    if (display) {
+      const svgIcon = getSVGIconById(icon);
+      if (svgIcon) {
+        display.innerHTML = `<span class="w-5 h-5">${svgIcon}</span>`;
+      } else {
+        display.textContent = icon;
+      }
+    }
+  }
+
+  // 切换任务标签选择
+  private toggleTagSelection(tagId: string): void {
+    if (this.selectedTagsForTask.has(tagId)) {
+      this.selectedTagsForTask.delete(tagId);
+    } else {
+      this.selectedTagsForTask.add(tagId);
+    }
+    // 只更新标签按钮样式，不重新渲染整个页面（避免输入框内容丢失）
+    const btn = document.querySelector(`[data-tag-id="${tagId}"]`);
+    if (btn) {
+      // 查找或创建勾选标记 span
+      let checkSpan = btn.querySelector('.tag-check-mark');
+      if (this.selectedTagsForTask.has(tagId)) {
+        btn.classList.add('ring-2', 'ring-blue-500', 'ring-offset-1');
+        // 添加勾选标记
+        if (!checkSpan) {
+          checkSpan = document.createElement('span');
+          checkSpan.className = 'tag-check-mark';
+          checkSpan.textContent = ' ✓';
+          btn.appendChild(checkSpan);
+        }
+      } else {
+        btn.classList.remove('ring-2', 'ring-blue-500', 'ring-offset-1');
+        // 移除勾选标记
+        if (checkSpan) {
+          checkSpan.remove();
+        }
+      }
+    }
+  }
+
+  // 知识库搜索输入
+  public onGuideSearchInput(value: string): void {
+    // 更新状态，但不做任何可能触发重新渲染的操作
+    this.guideSearchKeyword = value;
+    this.showGuideDropdown = true;
+    // 如果清空了输入，也清除选中
+    if (!value) {
+      this.selectedGuideId = '';
+    }
+    // 使用 requestAnimationFrame 延迟更新下拉列表，避免干扰输入
+    requestAnimationFrame(() => {
+      const dropdown = document.getElementById('guideDropdown');
+      if (dropdown) {
+        const isDark = this.themeMode === 'dark';
+        dropdown.innerHTML = this.generateGuideDropdownItems(isDark);
+        dropdown.style.display = 'block';
+      }
+    });
+  }
+
+  // 知识库搜索框获取焦点
+  public onGuideSearchFocus(): void {
+    this.showGuideDropdown = true;
+    // 只显示下拉列表，不重新渲染整个页面
+    const dropdown = document.getElementById('guideDropdown');
+    if (dropdown) {
+      dropdown.style.display = 'block';
+    }
+  }
+
+  // 选择知识库
+  public selectGuide(guideId: string, guideName: string): void {
+    this.selectedGuideId = guideId;
+    this.guideSearchKeyword = guideName;
+    this.showGuideDropdown = false;
+    // 只更新输入框、隐藏下拉、显示清除按钮，不重新渲染整个页面
+    const input = document.getElementById('guideSearchInput') as HTMLInputElement;
+    if (input) {
+      input.value = guideName;
+    }
+    const dropdown = document.getElementById('guideDropdown');
+    if (dropdown) {
+      dropdown.style.display = 'none';
+    }
+    const clearBtn = document.getElementById('guideClearBtn');
+    if (clearBtn) {
+      clearBtn.style.display = 'block';
+    }
+  }
+
+  // 清除选中的知识库
+  public clearSelectedGuide(): void {
+    this.selectedGuideId = '';
+    this.guideSearchKeyword = '';
+    this.showGuideDropdown = false;
+    const input = document.getElementById('guideSearchInput') as HTMLInputElement;
+    if (input) {
+      input.value = '';
+    }
+    const dropdown = document.getElementById('guideDropdown');
+    if (dropdown) {
+      dropdown.style.display = 'none';
+    }
+    const clearBtn = document.getElementById('guideClearBtn');
+    if (clearBtn) {
+      clearBtn.style.display = 'none';
+    }
+  }
+
+  // 关闭知识库下拉（点击外部时调用）
+  public closeGuideDropdown(): void {
+    if (this.showGuideDropdown) {
+      this.showGuideDropdown = false;
+      const dropdown = document.getElementById('guideDropdown');
+      if (dropdown) {
+        dropdown.style.display = 'none';
+      }
+    }
+  }
+
+  // 生成知识库下拉列表HTML
+  private generateGuideDropdownHTML(isDark: boolean, inputBg: string): string {
+    return `
+      <div id="guideDropdown" 
+           class="absolute left-0 right-0 top-full mt-1 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} border rounded-lg shadow-lg max-h-48 overflow-y-auto z-50">
+        ${this.generateGuideDropdownItems(isDark)}
+      </div>
+    `;
+  }
+
+  // 生成知识库下拉列表项
+  private generateGuideDropdownItems(isDark: boolean): string {
+    const keyword = this.guideSearchKeyword.toLowerCase().trim();
+    const filteredGuides = keyword 
+      ? this.knowledgeGuides.filter(g => g.name.toLowerCase().includes(keyword))
+      : this.knowledgeGuides;
+    
+    if (filteredGuides.length === 0) {
+      return `<div class="px-3 py-2 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">无匹配的知识库</div>`;
+    }
+    
+    return filteredGuides.map(guide => `
+      <div onclick="event.stopPropagation(); planner.selectGuide('${guide.id}', '${guide.name.replace(/'/g, "\\'")}')"
+           class="px-3 py-2 text-sm cursor-pointer ${isDark ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-800 hover:bg-gray-100'} ${this.selectedGuideId === guide.id ? (isDark ? 'bg-gray-700' : 'bg-blue-50') : ''}">
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
+          </svg>
+          <span>${guide.name}</span>
+          ${this.selectedGuideId === guide.id ? '<span class="ml-auto text-blue-500">✓</span>' : ''}
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // 处理添加任务
+  private handleAddTask(): void {
+    const input = document.getElementById('taskInput') as HTMLTextAreaElement;
+    const prioritySelect = document.getElementById('prioritySelect') as HTMLSelectElement;
+    const timeSelect = document.getElementById('taskTimeInput') as HTMLSelectElement;
+    const text = input?.value?.trim();
+    const priority = prioritySelect?.value as TaskPriority || 'normal';
+    const tags = Array.from(this.selectedTagsForTask);
+    const time = timeSelect?.value || '';
+    const guideId = this.selectedGuideId;
+    
+    if (!text) return;
+    
+    this.addTask(text, priority, tags, time, guideId);
+    
+    // 清空输入和选择
+    if (input) input.value = '';
+    this.selectedGuideId = '';
+    this.guideSearchKeyword = '';
+    this.showGuideDropdown = false;
+    this.selectedTagsForTask.clear();
+    this.preselectedTime = '';
+  }
+
+  // 更新任务标签
+  private updateTaskTags(taskId: string, tags: string[]): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task) {
+        task.tags = tags;
+        this.saveTasks();
+        this.render();
+      }
+    }
+  }
+
+  // 快速添加标签的任务ID
+  private quickTagTaskId: string = '';
+
+  // 显示快速标签选择器
+  private showQuickTagSelector(taskId: string): void {
+    this.quickTagTaskId = taskId;
+    this.render();
+  }
+
+  // 切换任务的某个标签
+  private toggleTaskTag(tagId: string): void {
+    if (!this.selectedDate || !this.quickTagTaskId) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === this.quickTagTaskId);
+      if (task) {
+        if (!task.tags) task.tags = [];
+        const idx = task.tags.indexOf(tagId);
+        if (idx >= 0) {
+          task.tags.splice(idx, 1);
+        } else {
+          task.tags.push(tagId);
+        }
+        this.saveTasks();
+        this.quickTagTaskId = '';
+        this.render();
+      }
+    }
+  }
+
+  // 设置任务排序方式
+  private setTaskSortBy(sortBy: TaskSortBy): void {
+    this.taskSortBy = sortBy;
+    this.saveTaskSortBy(sortBy);
+    this.render();
+  }
+
+  // 获取排序后的任务列表
+  private getSortedTasks(tasks: Task[]): Task[] {
+    // 先按标签筛选
+    let filtered = tasks;
+    if (this.selectedTagFilter) {
+      filtered = tasks.filter(t => (t.tags || []).includes(this.selectedTagFilter));
+    }
+    
+    const sorted = [...filtered];
+    
+    switch (this.taskSortBy) {
+      case 'priority':
+        sorted.sort((a, b) => {
+          // 已完成的任务放最后
+          if (a.completed !== b.completed) return a.completed ? 1 : -1;
+          // 未完成任务按优先级排序
+          const pa = getPriorityConfig(a.priority).order;
+          const pb = getPriorityConfig(b.priority).order;
+          if (pa !== pb) return pa - pb;
+          return a.time.localeCompare(b.time);
+        });
+        break;
+      case 'status':
+        sorted.sort((a, b) => {
+          if (a.completed !== b.completed) return a.completed ? 1 : -1;
+          return a.time.localeCompare(b.time);
+        });
+        break;
+      case 'time':
+        sorted.sort((a, b) => {
+          // 已完成的任务放最后
+          if (a.completed !== b.completed) return a.completed ? 1 : -1;
+          return a.time.localeCompare(b.time);
+        });
+        break;
+      case 'text':
+        sorted.sort((a, b) => {
+          // 已完成的任务放最后
+          if (a.completed !== b.completed) return a.completed ? 1 : -1;
+          return a.text.localeCompare(b.text);
+        });
+        break;
+    }
+    
+    return sorted;
+  }
+
+  // 初始化 Electron API
+  private initElectronAPI(): void {
+    // 检查是否在 Electron 环境中
+    if (window.electronAPI) {
+      // 监听窗口准备完成事件
+      window.electronAPI.onWindowReady(() => {
+        console.log('[Electron] 窗口准备完成');
+        // 确保 DOM 渲染完成后重新渲染
+        requestAnimationFrame(() => {
+          this.render();
+        });
+      });
+
+      // 获取窗口置顶状态
+      window.electronAPI.isAlwaysOnTop().then(isOnTop => {
+        this.isAlwaysOnTop = isOnTop;
+      });
+      
+      // 监听主进程请求提醒数据
+      window.electronAPI.onRequestReminderData(() => {
+        this.sendReminderDataToMain();
+      });
+
+      // 监听跳转到日期
+      window.electronAPI.onNavigateToDate((date: string) => {
+        this.jumpToDate(date);
+      });
+
+      // 获取提醒配置
+      window.electronAPI.getReminderConfig().then(config => {
+        this.reminderConfig = config;
+      });
+
+      // ==================== 自动更新事件监听 ====================
+      
+      // 发现新版本
+      window.electronAPI.onUpdateAvailable((info) => {
+        console.log('[更新] 发现新版本:', info.version);
+        this.updateAvailable = true;
+        this.updateInfo = info;
+        this.checkingForUpdate = false;
+        // 只有手动检查时才弹出弹窗，自动检查静默下载
+        if (this.isManualCheck) {
+          this.showUpdateModal = true;
+        }
+        this.render();
+      });
+
+      // 没有新版本
+      window.electronAPI.onUpdateNotAvailable(() => {
+        console.log('[更新] 当前已是最新版本');
+        this.checkingForUpdate = false;
+        if (this.isManualCheck) {
+          // 如果是手动检查，显示提示
+          alert('当前已是最新版本！');
+          this.showUpdateModal = false;
+        }
+        this.render();
+      });
+
+      // 下载进度
+      window.electronAPI.onDownloadProgress((progress) => {
+        console.log('[更新] 下载进度:', progress.percent.toFixed(1) + '%');
+        this.downloadProgress = progress;
+        this.render();
+      });
+
+      // 下载完成
+      window.electronAPI.onUpdateDownloaded((info) => {
+        console.log('[更新] 下载完成，准备安装');
+        this.updateDownloaded = true;
+        this.downloadProgress = null;
+        this.render();
+      });
+
+      // 更新错误
+      window.electronAPI.onUpdateError((error) => {
+        console.error('[更新] 更新错误:', error);
+        this.checkingForUpdate = false;
+        this.downloadProgress = null;
+        alert('更新失败: ' + error);
+        this.render();
+      });
+    }
+  }
+
+  // 发送提醒数据到主进程
+  private sendReminderDataToMain(): void {
+    if (window.electronAPI) {
+      window.electronAPI.sendReminderData({
+        tasks: this.tasks,
+        anniversaries: this.anniversaries
+      });
+    }
+  }
+
+  // 测试通知
+  private testNotification(): void {
+    if (window.electronAPI) {
+      window.electronAPI.testNotification();
+    } else {
+      alert('通知功能仅在桌面应用中可用');
+    }
+  }
+
+  // ==================== 窗口控制方法 ====================
+  
+  // 最小化到托盘
+  private minimizeToTray(): void {
+    if (window.electronAPI) {
+      window.electronAPI.minimizeToTray();
+    }
+  }
+
+  // 切换最大化
+  private toggleMaximize(): void {
+    if (window.electronAPI) {
+      window.electronAPI.toggleMaximize();
+    }
+  }
+
+  // 关闭到托盘
+  private closeToTray(): void {
+    if (window.electronAPI) {
+      window.electronAPI.closeToTray();
+    }
+  }
+
+  // 切换窗口置顶
+  private async toggleAlwaysOnTop(): Promise<void> {
+    if (window.electronAPI) {
+      this.isAlwaysOnTop = await window.electronAPI.toggleAlwaysOnTop();
+      this.render();
+    }
+  }
+
+  // 播放提示音
+  private playNotificationSound(type: 'success' | 'reminder' | 'error' = 'success'): void {
+    // 使用 Web Audio API 播放提示音
+    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    // 不同类型使用不同频率
+    const frequencies = {
+      success: [523.25, 659.25, 783.99],  // C5, E5, G5 和弦
+      reminder: [440, 554.37, 659.25],      // A4, C#5, E5 和弦
+      error: [311.13, 392, 466.16]          // Eb4, G4, Bb4 和弦
+    };
+    
+    const notes = frequencies[type];
+    gainNode.gain.value = 0.1;
+    
+    notes.forEach((freq, index) => {
+      const osc = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      osc.connect(gain);
+      gain.connect(audioContext.destination);
+      osc.frequency.value = freq;
+      osc.type = 'sine';
+      gain.gain.value = 0.08;
+      gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.5);
+      osc.start(audioContext.currentTime + index * 0.1);
+      osc.stop(audioContext.currentTime + 0.5);
+    });
+  }
+
+  // ==================== 自动更新方法 ====================
+  
+  // 检查更新
+  private checkForUpdate(): void {
+    if (window.electronAPI) {
+      this.checkingForUpdate = true;
+      this.isManualCheck = true;  // 手动检查
+      this.showUpdateModal = true;
+      this.render();
+      window.electronAPI.checkForUpdate();
+    } else {
+      alert('更新功能仅在桌面应用中可用');
+    }
+  }
+
+  // 下载更新
+  private downloadUpdate(): void {
+    if (window.electronAPI) {
+      window.electronAPI.downloadUpdate();
+    }
+  }
+
+  // 安装更新（重启应用）
+  private installUpdate(): void {
+    if (window.electronAPI) {
+      window.electronAPI.installUpdate();
+    }
+  }
+
+  // 关闭更新弹窗
+  private closeUpdateModal(): void {
+    this.showUpdateModal = false;
+    this.isManualCheck = false;
+    this.render();
+  }
+
+  // 从 localStorage 加载节假日缓存
+  private loadHolidayCache(): HolidayCache {
+    const cacheVersion = localStorage.getItem('dailyPlannerHolidaysVersion');
+    if (cacheVersion !== HOLIDAY_CACHE_VERSION) {
+      localStorage.removeItem('dailyPlannerHolidays');
+      localStorage.setItem('dailyPlannerHolidaysVersion', HOLIDAY_CACHE_VERSION);
+      return {};
+    }
+
+    const saved = localStorage.getItem('dailyPlannerHolidays');
+    try {
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      localStorage.removeItem('dailyPlannerHolidays');
+      return {};
+    }
+  }
+
+  // 保存节假日缓存到 localStorage
+  private saveHolidayCache(): void {
+    localStorage.setItem('dailyPlannerHolidaysVersion', HOLIDAY_CACHE_VERSION);
+    localStorage.setItem('dailyPlannerHolidays', JSON.stringify(this.holidayCache));
+  }
+
+  // 加载指定年份的节假日数据
+  private async loadHolidaysForYear(year: number): Promise<void> {
+    const yearStr = year.toString();
+    
+    // 如果已经缓存了这一年的数据，则跳过
+    if (this.holidayCache[yearStr]) {
+      return;
+    }
+
+    // 使用本地硬编码的节假日数据（更可靠）
+    const localHolidays = this.getLocalHolidays(year);
+    if (localHolidays) {
+      this.holidayCache[yearStr] = localHolidays;
+      this.saveHolidayCache();
+      return;
+    }
+
+    // 如果本地没有数据，尝试从缓存加载
+    const savedCache = this.loadHolidayCache();
+    if (savedCache[yearStr]) {
+      this.holidayCache[yearStr] = savedCache[yearStr];
+    }
+  }
+
+  // 获取国务院办公厅正式公布的中国大陆节假日数据
+  private getLocalHolidays(year: number): Record<string, HolidayInfo> | null {
+    type HolidayPeriod = {
+      name: string;
+      start: string;
+      end: string;
+      statutoryDates: string[];
+      labelOverrides?: Record<string, string>;
+    };
+
+    type OfficialHolidaySchedule = {
+      periods: HolidayPeriod[];
+      workdays: Array<{ date: string; name: string }>;
+    };
+
+    const schedules: Record<number, OfficialHolidaySchedule> = {
+      2025: {
+        periods: [
+          { name: '元旦', start: '2025-01-01', end: '2025-01-01', statutoryDates: ['2025-01-01'] },
+          {
+            name: '春节',
+            start: '2025-01-28',
+            end: '2025-02-04',
+            statutoryDates: ['2025-01-28', '2025-01-29', '2025-01-30', '2025-01-31']
+          },
+          { name: '清明节', start: '2025-04-04', end: '2025-04-06', statutoryDates: ['2025-04-04'] },
+          {
+            name: '劳动节',
+            start: '2025-05-01',
+            end: '2025-05-05',
+            statutoryDates: ['2025-05-01', '2025-05-02']
+          },
+          { name: '端午节', start: '2025-05-31', end: '2025-06-02', statutoryDates: ['2025-05-31'] },
+          {
+            name: '国庆节',
+            start: '2025-10-01',
+            end: '2025-10-08',
+            statutoryDates: ['2025-10-01', '2025-10-02', '2025-10-03', '2025-10-06'],
+            labelOverrides: { '2025-10-06': '中秋节' }
+          }
+        ],
+        workdays: [
+          { date: '2025-01-26', name: '春节' },
+          { date: '2025-02-08', name: '春节' },
+          { date: '2025-04-27', name: '劳动节' },
+          { date: '2025-09-28', name: '国庆节' },
+          { date: '2025-10-11', name: '国庆节' }
+        ]
+      },
+      2026: {
+        periods: [
+          { name: '元旦', start: '2026-01-01', end: '2026-01-03', statutoryDates: ['2026-01-01'] },
+          {
+            name: '春节',
+            start: '2026-02-15',
+            end: '2026-02-23',
+            statutoryDates: ['2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19']
+          },
+          { name: '清明节', start: '2026-04-04', end: '2026-04-06', statutoryDates: ['2026-04-05'] },
+          {
+            name: '劳动节',
+            start: '2026-05-01',
+            end: '2026-05-05',
+            statutoryDates: ['2026-05-01', '2026-05-02']
+          },
+          { name: '端午节', start: '2026-06-19', end: '2026-06-21', statutoryDates: ['2026-06-19'] },
+          { name: '中秋节', start: '2026-09-25', end: '2026-09-27', statutoryDates: ['2026-09-25'] },
+          {
+            name: '国庆节',
+            start: '2026-10-01',
+            end: '2026-10-07',
+            statutoryDates: ['2026-10-01', '2026-10-02', '2026-10-03']
+          }
+        ],
+        workdays: [
+          { date: '2026-01-04', name: '元旦' },
+          { date: '2026-02-14', name: '春节' },
+          { date: '2026-02-28', name: '春节' },
+          { date: '2026-05-09', name: '劳动节' },
+          { date: '2026-09-20', name: '国庆节' },
+          { date: '2026-10-10', name: '国庆节' }
+        ]
+      }
+    };
+
+    const schedule = schedules[year];
+    if (!schedule) return null;
+
+    const holidays: Record<string, HolidayInfo> = {};
+
+    schedule.periods.forEach(period => {
+      const date = parseLocalDate(period.start);
+      const endDate = parseLocalDate(period.end);
+
+      while (date <= endDate) {
+        const dateKey = this.formatDate(date);
+        holidays[dateKey] = {
+          date: dateKey,
+          name: period.labelOverrides?.[dateKey] || period.name,
+          holiday: true,
+          wage: period.statutoryDates.includes(dateKey) ? 3 : 1
+        };
+        date.setDate(date.getDate() + 1);
+      }
+    });
+
+    schedule.workdays.forEach(workday => {
+      holidays[workday.date] = {
+        date: workday.date,
+        name: workday.name,
+        holiday: false,
+        wage: 1
+      };
+    });
+
+    return holidays;
+  }
+
+  // 获取农历信息
+  private getLunarInfo(date: Date): { day: string; month: string; jieQi: string | null; festival: string | null } {
+    const solar = Solar.fromDate(date);
+    const lunar = solar.getLunar();
+    
+    // 农历日
+    const lunarDay = lunar.getDayInChinese();
+    
+    // 农历月（中文月份名：正、二、三...）
+    const lunarMonth = lunar.getMonthInChinese();
+    
+    // 节气
+    const jieQi = lunar.getJieQi();
+    
+    // 农历节日
+    const festivals = lunar.getFestivals();
+    const festival = festivals && festivals.length > 0 ? festivals[0] : null;
+    
+    return {
+      day: lunarDay,
+      month: lunarMonth,
+      jieQi: jieQi || null,
+      festival: festival || null
+    };
+  }
+
+  // 获取农历显示文本（用于日历格子，优先显示节气/节日，否则显示农历日）
+  private getLunarDisplayText(date: Date): string {
+    const lunarInfo = this.getLunarInfo(date);
+    
+    // 优先显示节气
+    if (lunarInfo.jieQi) {
+      return lunarInfo.jieQi;
+    }
+    
+    // 其次显示农历节日
+    if (lunarInfo.festival) {
+      return lunarInfo.festival;
+    }
+    
+    // 初一显示月份（如"正月"、"二月"）
+    if (lunarInfo.day === '初一') {
+      return lunarInfo.month + '月';
+    }
+    
+    // 其他显示农历日（如"初二"、"十五"、"廿三"）
+    return lunarInfo.day;
+  }
+
+  // 获取完整农历文本（用于任务面板，显示月份+日期）
+  private getLunarFullText(date: Date): string {
+    const lunarInfo = this.getLunarInfo(date);
+    
+    // 节气：显示月份+节气
+    if (lunarInfo.jieQi) {
+      return lunarInfo.month + '月 ' + lunarInfo.jieQi;
+    }
+    
+    // 农历节日：显示月份+节日
+    if (lunarInfo.festival) {
+      return lunarInfo.month + '月' + lunarInfo.day + ' ' + lunarInfo.festival;
+    }
+    
+    // 其他：显示月份+日期（如"二月廿一"）
+    return lunarInfo.month + '月' + lunarInfo.day;
+  }
+
+  // 判断是否是节气日
+  private isJieQiDay(date: Date): boolean {
+    const lunarInfo = this.getLunarInfo(date);
+    return lunarInfo.jieQi !== null;
+  }
+
+  // 获取指定日期的节假日信息
+  private getHolidayInfo(date: Date): HolidayInfo | null {
+    const yearStr = date.getFullYear().toString();
+    const dateKey = this.formatDate(date);
+    
+    // 如果没有这一年的缓存，尝试加载
+    if (!this.holidayCache[yearStr]) {
+      this.loadHolidaysForYear(date.getFullYear());
+      return null;
+    }
+
+    return this.holidayCache[yearStr][dateKey] || null;
+  }
+
+  // 判断是否是实际工作日（考虑调休）
+  private isActualWorkday(date: Date): boolean {
+    const holidayInfo = this.getHolidayInfo(date);
+    
+    // 如果有节假日数据
+    if (holidayInfo) {
+      // 如果是假日（包括法定假日和普通假日）
+      if (holidayInfo.holiday) {
+        return false;
+      }
+      // 如果是调休工作日（周末需要上班）
+      return true;
+    }
+    
+    // 没有节假日数据时，默认周一到周五是工作日
+    const dayOfWeek = date.getDay();
+    return dayOfWeek >= 1 && dayOfWeek <= 5;
+  }
+
+  // 判断是否是法定假日（三倍工资）
+  private isLegalHoliday(date: Date): boolean {
+    const holidayInfo = this.getHolidayInfo(date);
+    return holidayInfo?.wage === 3;
+  }
+
+  // 获取节假日显示名称
+  private getHolidayDisplayName(date: Date): string | null {
+    const holidayInfo = this.getHolidayInfo(date);
+    if (!holidayInfo) return null;
+    
+    if (holidayInfo.holiday) {
+      return holidayInfo.name;
+    } else if (!holidayInfo.holiday) {
+      return `补班(${holidayInfo.name})`;
+    }
+    
+    return null;
+  }
+
+  // 从 localStorage 加载任务
+  private loadTasks(): DateTasks {
+    const saved = localStorage.getItem('dailyPlannerTasks');
+    return saved ? JSON.parse(saved) : {};
+  }
+
+  // 保存任务到 localStorage
+  private saveTasks(): void {
+    localStorage.setItem('dailyPlannerTasks', JSON.stringify(this.tasks));
+  }
+
+  // 加载总结文字
+  private loadSummaryNotes(): { weekly: Record<string, string>; monthly: Record<string, string>; yearly: Record<string, string> } {
+    const saved = localStorage.getItem('dailyPlannerSummaryNotes');
+    return saved ? JSON.parse(saved) : { weekly: {}, monthly: {}, yearly: {} };
+  }
+
+  // 保存总结文字
+  private saveSummaryNotes(): void {
+    localStorage.setItem('dailyPlannerSummaryNotes', JSON.stringify(this.summaryNotes));
+  }
+
+  // 保存周总结文字（带状态提示）
+  public saveWeeklySummaryNoteWithStatus(note: string): void {
+    const key = this.getWeekKey(this.viewingWeekOffset);
+    this.summaryNotes.weekly[key] = note;
+    this.saveSummaryNotes();
+    this.showSaveStatus();
+  }
+
+  // 保存月总结文字（带状态提示）
+  public saveMonthlySummaryNoteWithStatus(note: string): void {
+    const key = this.getMonthKey(this.viewingMonthOffset);
+    this.summaryNotes.monthly[key] = note;
+    this.saveSummaryNotes();
+    this.showSaveStatus();
+  }
+
+  // 保存年度总结文字（带状态提示）
+  public saveYearlySummaryNoteWithStatus(note: string): void {
+    const key = this.getYearKey(this.viewingYearOffset);
+    this.summaryNotes.yearly[key] = note;
+    this.saveSummaryNotes();
+    this.showSaveStatus();
+  }
+
+  // 显示保存状态
+  private showSaveStatus(): void {
+    this.saveStatus = 'saved';
+    this.render();
+    // 2秒后清除状态
+    setTimeout(() => {
+      this.saveStatus = '';
+      this.render();
+    }, 2000);
+  }
+
+  // 生成通知面板HTML
+  private generateNotificationPanelHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const notifications = this.getUnreadNotifications();
+    const unreadCount = this.getUnreadCount();
+    
+    return `
+      <div class="fixed inset-0 z-40" onclick="planner.showNotificationPanel = false; planner.render();"></div>
+      <div class="absolute right-0 top-full mt-2 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-100'} rounded-lg shadow-xl border w-80 max-h-96 overflow-hidden z-50">
+        <div class="flex items-center justify-between px-4 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-100'}">
+          <h3 class="font-semibold ${isDark ? 'text-gray-100' : 'text-gray-800'}">待办提醒</h3>
+          <div class="flex items-center gap-2">
+            ${notifications.length > 0 ? `
+              <button onclick="event.stopPropagation(); planner.markAllNotificationsRead()" class="text-xs ${isDark ? 'text-blue-400 hover:text-blue-300' : 'text-blue-500 hover:text-blue-600'}">
+                全部已读
+              </button>
+              <span class="${isDark ? 'text-gray-600' : 'text-gray-300'}">|</span>
+              <button onclick="event.stopPropagation(); planner.clearAllNotifications()" class="text-xs ${isDark ? 'text-red-400 hover:text-red-300' : 'text-red-500 hover:text-red-600'}">
+                清空列表
+              </button>
+            ` : ''}
+          </div>
+        </div>
+        <div class="overflow-y-auto max-h-72">
+          ${notifications.length > 0 ? notifications.map(n => {
+            const isRead = this.readNotificationIds.has(n.id);
+            const diffDays = n.diffDays || 0;
+            // 修复日期解析：使用本地时间解析日期字符串，避免UTC时区问题
+            const [year, month, day] = n.date.split('-').map(Number);
+            const dateObj = new Date(year, month - 1, day);
+            let dateLabel = '';
+            if (diffDays === 0) dateLabel = '今天';
+            else if (diffDays === 1) dateLabel = '明天';
+            else if (diffDays === 2) dateLabel = '后天';
+            else dateLabel = `${dateObj.getMonth() + 1}月${dateObj.getDate()}日`;
+            
+            return `
+              <div onclick="planner.jumpToTaskFromNotification('${n.dateKey}', '${n.taskId}', '${n.id}')"
+                   class="px-4 py-3 border-b ${isDark ? 'border-gray-700 hover:bg-gray-700' : 'border-gray-100 hover:bg-gray-50'} cursor-pointer transition-colors ${isRead ? 'opacity-60' : ''}">
+                <div class="flex items-start gap-2">
+                  ${!isRead ? `<span class="w-2 h-2 bg-red-500 rounded-full mt-1.5 flex-shrink-0"></span>` : '<span class="w-2"></span>'}
+                  <div class="flex-1 min-w-0">
+                    <p class="text-sm ${isDark ? 'text-gray-200' : 'text-gray-800'} truncate">${n.taskText}</p>
+                    <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} mt-0.5">${dateLabel}</p>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join('') : `
+            <div class="px-4 py-8 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}">
+              <svg class="w-12 h-12 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>
+              </svg>
+              <p class="text-sm">暂无待办提醒</p>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+  
+  // 清空所有通知
+  public clearAllNotifications(): void {
+    const notifications = this.getUnreadNotifications();
+    notifications.forEach(n => this.clearedNotificationIds.add(n.id));
+    this.saveNotificationState();
+    this.render();
+  }
+
+  // 生成保存状态HTML
+  private generateSaveStatusHTML(): string {
+    if (this.saveStatus === 'saved') {
+      return `
+        <div class="fixed top-4 right-4 z-[70] px-4 py-2 bg-green-500 text-white rounded-lg shadow-lg flex items-center gap-2 animate-fade-in">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+          </svg>
+          <span>已保存</span>
+        </div>
+      `;
+    }
+    return '';
+  }
+
+  // 加载知识库指南
+  private async loadKnowledgeGuides(): Promise<KnowledgeGuide[]> {
+    // 优先使用文件存储（Electron环境）
+    if (window.electronAPI?.loadKnowledgeFile) {
+      try {
+        const data = await window.electronAPI.loadKnowledgeFile();
+        console.log('[知识库] 从文件加载成功');
+        return (data as KnowledgeGuide[]) || [];
+      } catch (error) {
+        console.error('[知识库] 从文件加载失败，回退到localStorage:', error);
+      }
+    }
+    // 回退到localStorage
+    const saved = localStorage.getItem('dailyPlannerKnowledgeGuides');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存知识库指南
+  private saveKnowledgeGuides(): void {
+    // 异步保存，不阻塞UI
+    (async () => {
+      // 优先使用文件存储（Electron环境）
+      if (window.electronAPI?.saveKnowledgeFile) {
+        try {
+          const result = await window.electronAPI.saveKnowledgeFile(this.knowledgeGuides);
+          if (result.success) {
+            console.log('[知识库] 保存到文件成功');
+            return;
+          } else {
+            console.error('[知识库] 保存到文件失败:', result.error);
+            throw new Error(result.error);
+          }
+        } catch (error) {
+          console.error('[知识库] 保存到文件失败，尝试localStorage:', error);
+        }
+      }
+      // 回退到localStorage
+      try {
+        localStorage.setItem('dailyPlannerKnowledgeGuides', JSON.stringify(this.knowledgeGuides));
+      } catch (error) {
+        console.error('[知识库] localStorage保存失败:', error);
+        alert('存储空间不足！建议导出知识库备份后，清理一些图片。');
+      }
+    })();
+  }
+
+  // 导出知识库（ZIP格式，自动压缩）
+  public async exportKnowledgeBase(): Promise<void> {
+    const data = {
+      version: '2.0',
+      exportDate: new Date().toISOString(),
+      guides: this.knowledgeGuides,
+      compressed: true
+    };
+    
+    // 创建 ZIP 文件
+    const zip = new JSZip();
+    
+    // 添加 JSON 数据
+    const jsonStr = JSON.stringify(data, null, 2);
+    zip.file('knowledge.json', jsonStr);
+    
+    // 添加说明文件
+    const readme = `# 知识库备份
+
+导出时间: ${new Date().toLocaleString()}
+指南数量: ${this.knowledgeGuides.length}
+版本: 2.0
+
+## 导入说明
+1. 在知识库页面点击"导入"按钮
+2. 选择此 ZIP 文件
+3. 选择合并或替换现有数据
+
+## 数据格式
+- knowledge.json: 知识库数据（包含图片的base64编码）
+- 图片已在导出时自动压缩
+
+## 兼容性
+- 支持 v1.0 和 v2.0 格式的 JSON 文件导入
+- 推荐使用 ZIP 格式以获得最佳压缩效果
+`;
+    zip.file('README.txt', readme);
+    
+    try {
+      // 生成 ZIP 文件
+      const content = await zip.generateAsync({ 
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 9 }  // 最高压缩级别
+      });
+      
+      // 下载文件
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `知识库备份_${new Date().toLocaleDateString().replace(/\//g, '-')}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      
+      // 显示压缩效果
+      const jsonSize = Math.round(jsonStr.length / 1024);
+      const zipSize = Math.round(content.size / 1024);
+      const ratio = Math.round((1 - zipSize / jsonSize) * 100);
+      console.log(`[导出] JSON: ${jsonSize}KB, ZIP: ${zipSize}KB, 压缩率: ${ratio}%`);
+    } catch (error) {
+      console.error('[导出] ZIP压缩失败，回退到JSON格式:', error);
+      // 回退到普通 JSON 导出
+      this.exportKnowledgeBaseAsJson();
+    }
+  }
+  
+  // 导出知识库（JSON格式，备用）
+  private exportKnowledgeBaseAsJson(): void {
+    const data = {
+      version: '2.0',
+      exportDate: new Date().toISOString(),
+      guides: this.knowledgeGuides,
+      compressed: true
+    };
+    
+    const jsonStr = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `知识库备份_${new Date().toLocaleDateString().replace(/\//g, '-')}.json`;
+    a.click();
+    
+    URL.revokeObjectURL(url);
+  }
+
+  // 导入知识库（支持ZIP和JSON）
+  public importKnowledgeBase(): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.zip,.json';
+    
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      
+      try {
+        let data: { version: string; guides: KnowledgeGuide[]; compressed?: boolean };
+        
+        if (file.name.endsWith('.zip')) {
+          // 处理 ZIP 文件
+          const zip = await JSZip.loadAsync(file);
+          const jsonFile = zip.file('knowledge.json');
+          
+          if (!jsonFile) {
+            alert('ZIP文件中没有找到 knowledge.json');
+            return;
+          }
+          
+          const jsonStr = await jsonFile.async('string');
+          data = JSON.parse(jsonStr);
+          console.log('[导入] 从ZIP文件导入成功');
+        } else {
+          // 处理 JSON 文件
+          const reader = new FileReader();
+          const jsonStr = await new Promise<string>((resolve, reject) => {
+            reader.onload = (event) => resolve(event.target?.result as string);
+            reader.onerror = reject;
+            reader.readAsText(file);
+          });
+          data = JSON.parse(jsonStr);
+        }
+        
+        // 验证数据格式
+        if (!data.guides || !Array.isArray(data.guides)) {
+          alert('无效的知识库文件格式');
+          return;
+        }
+        
+        // 询问用户是覆盖还是合并
+        const merge = confirm(`检测到 ${data.guides.length} 个指南。\n\n点击"确定"合并到现有知识库\n点击"取消"替换现有知识库`);
+        
+        if (merge) {
+          // 合并：添加新指南，跳过已存在的
+          const existingIds = new Set(this.knowledgeGuides.map(g => g.id));
+          const newGuides = data.guides.filter((g: KnowledgeGuide) => !existingIds.has(g.id));
+          this.knowledgeGuides.push(...newGuides);
+          alert(`成功导入 ${newGuides.length} 个新指南`);
+        } else {
+          // 替换
+          this.knowledgeGuides = data.guides;
+          alert(`成功导入 ${data.guides.length} 个指南`);
+        }
+        
+        this.saveKnowledgeGuides();
+        this.render();
+      } catch (err) {
+        alert('导入失败：文件格式错误');
+        console.error('导入失败:', err);
+      }
+    };
+    
+    input.click();
+  }
+
+  // 创建新指南
+  public createNewGuide(): void {
+    const newGuide: KnowledgeGuide = {
+      id: Date.now().toString(),
+      name: '新指南',
+      steps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    // 不立即保存到列表，只在编辑器中显示
+    // 用户点击保存按钮时才会真正保存
+    this.editingGuideId = newGuide.id;
+    this.currentGuide = newGuide;
+    this.render();
+  }
+
+  // 打开指南编辑
+  public openGuideEdit(guideId: string): void {
+    const guide = this.knowledgeGuides.find(g => g.id === guideId);
+    if (guide) {
+      this.currentGuide = { ...guide, steps: [...guide.steps] };
+      this.editingGuideId = guideId;
+      this.render();
+    }
+  }
+
+  // 保存当前指南
+  public saveCurrentGuide(): void {
+    if (!this.currentGuide) return;
+    const index = this.knowledgeGuides.findIndex(g => g.id === this.currentGuide!.id);
+    this.currentGuide.updatedAt = Date.now();
+    if (index >= 0) {
+      // 更新已存在的指南
+      this.knowledgeGuides[index] = { ...this.currentGuide };
+    } else {
+      // 新指南，添加到列表
+      this.knowledgeGuides.push({ ...this.currentGuide });
+    }
+    this.saveKnowledgeGuides();
+  }
+
+  // 保存指南（带状态提示）
+  public saveGuideWithStatus(): void {
+    // 先保存所有编辑区域的内容
+    if (this.currentGuide) {
+      this.currentGuide.steps.forEach(step => {
+        const textarea = document.getElementById(`step-content-${step.id}`) as HTMLTextAreaElement;
+        if (textarea && this.currentGuide) {
+          const s = this.currentGuide.steps.find(st => st.id === step.id);
+          if (s) {
+            s.content = textarea.value;
+          }
+        }
+      });
+    }
+    this.saveCurrentGuide();
+    this.showSaveStatus();
+  }
+
+  // 删除指南
+  public deleteGuide(guideId: string): void {
+    const guide = this.knowledgeGuides.find(g => g.id === guideId);
+    if (!guide) return;
+    
+    if (!confirm(`确定要删除指南「${guide.name}」吗？此操作不可撤销。`)) {
+      return;
+    }
+    
+    this.knowledgeGuides = this.knowledgeGuides.filter(g => g.id !== guideId);
+    this.saveKnowledgeGuides();
+    this.render();
+  }
+
+  // 添加步骤
+  public addStepToGuide(): void {
+    if (!this.currentGuide) return;
+    
+    // 先保存所有现有 textarea 的当前内容
+    this.currentGuide.steps.forEach(step => {
+      const textarea = document.getElementById(`step-content-${step.id}`) as HTMLTextAreaElement;
+      if (textarea) {
+        step.content = textarea.value;
+      }
+    });
+    
+    const newStep: KnowledgeStep = {
+      id: Date.now().toString(),
+      title: '',
+      content: '',
+      order: this.currentGuide.steps.length
+    };
+    this.currentGuide.steps.push(newStep);
+    this.saveCurrentGuide();
+    this.render();
+  }
+
+  // 删除步骤
+  public deleteStep(stepId: string): void {
+    if (!this.currentGuide) return;
+    
+    // 先保存所有现有 textarea 的当前内容
+    this.currentGuide.steps.forEach(step => {
+      const textarea = document.getElementById(`step-content-${step.id}`) as HTMLTextAreaElement;
+      if (textarea) {
+        step.content = textarea.value;
+      }
+    });
+    
+    this.currentGuide.steps = this.currentGuide.steps.filter(s => s.id !== stepId);
+    // 重新排序
+    this.currentGuide.steps.forEach((s, i) => s.order = i);
+    this.saveCurrentGuide();
+    this.render();
+  }
+
+  // 移动步骤
+  public moveStep(stepId: string, direction: 'up' | 'down'): void {
+    if (!this.currentGuide) return;
+    
+    // 先保存所有 textarea 的当前内容
+    this.currentGuide.steps.forEach(step => {
+      const textarea = document.getElementById(`step-content-${step.id}`) as HTMLTextAreaElement;
+      if (textarea) {
+        step.content = textarea.value;
+      }
+    });
+    
+    const index = this.currentGuide.steps.findIndex(s => s.id === stepId);
+    if (index === -1) return;
+    
+    const newIndex = direction === 'up' ? index - 1 : index + 1;
+    if (newIndex < 0 || newIndex >= this.currentGuide.steps.length) return;
+    
+    // 交换位置
+    [this.currentGuide.steps[index], this.currentGuide.steps[newIndex]] = 
+    [this.currentGuide.steps[newIndex], this.currentGuide.steps[index]];
+    
+    // 更新排序
+    this.currentGuide.steps.forEach((s, i) => s.order = i);
+    this.saveCurrentGuide();
+    this.render();
+  }
+
+  // 更新步骤内容（不自动保存，等用户点击保存按钮）
+  public updateStepContent(stepId: string, field: 'title' | 'content', value: string): void {
+    if (!this.currentGuide) return;
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step) {
+      step[field] = value;
+      // 不自动保存，等用户点击"保存指南"按钮
+    }
+  }
+
+  // 从 textarea 保存步骤内容（不自动保存，仅供手动调用）
+  public saveStepTextarea(stepId: string): void {
+    const textarea = document.getElementById(`step-content-${stepId}`) as HTMLTextAreaElement;
+    if (!textarea || !this.currentGuide) return;
+    
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step) {
+      step.content = textarea.value;
+      this.saveCurrentGuide();
+    }
+  }
+
+  // 放大图片
+  public enlargeImage(imageUrl: string, stepId?: string): void {
+    this.enlargedImageUrl = imageUrl;
+    this.enlargedImageStepId = stepId || '';
+    this.enlargedImageScale = 1;
+    this.render();
+  }
+
+  public zoomEnlargedImage(delta: number): void {
+    const previousScale = this.enlargedImageScale;
+    const nextScale = Math.min(4, Math.max(0.5,
+      Math.round((previousScale + delta) * 10) / 10));
+    if (nextScale === previousScale) return;
+
+    const image = document.getElementById('enlarged-knowledge-image') as HTMLImageElement | null;
+    const canvas = document.getElementById('enlarged-image-canvas') as HTMLElement | null;
+    const viewport = document.getElementById('enlarged-image-viewport') as HTMLElement | null;
+    const zoomLabel = document.getElementById('enlarged-image-zoom');
+
+    const nextLayoutScale = Math.max(1, nextScale);
+
+    this.enlargedImageScale = nextScale;
+    if (image) image.style.transform = `scale(${nextScale})`;
+    if (canvas) {
+      canvas.style.width = `${nextLayoutScale * 100}%`;
+      canvas.style.height = `${nextLayoutScale * 100}%`;
+      // 立即应用新画布尺寸，再按实际元素位置校正可视中心。
+      void canvas.offsetWidth;
+    }
+    if (viewport && image) {
+      const viewportRect = viewport.getBoundingClientRect();
+      const imageRect = image.getBoundingClientRect();
+      viewport.scrollLeft += imageRect.left + imageRect.width / 2
+        - (viewportRect.left + viewportRect.width / 2);
+      viewport.scrollTop += imageRect.top + imageRect.height / 2
+        - (viewportRect.top + viewportRect.height / 2);
+    }
+    if (zoomLabel) zoomLabel.textContent = `${Math.round(nextScale * 100)}%`;
+  }
+
+  public resetEnlargedImageZoom(): void {
+    const delta = 1 - this.enlargedImageScale;
+    this.zoomEnlargedImage(delta);
+  }
+  
+  // 关闭图片放大
+  public closeEnlargedImage(): void {
+    this.enlargedImageUrl = '';
+    this.enlargedImageStepId = '';
+    this.enlargedImageScale = 1;
+    this.render();
+  }
+  
+  // 从放大弹窗删除图片
+  public deleteEnlargedImage(): void {
+    if (this.enlargedImageStepId && this.enlargedImageUrl) {
+      this.removeImageByUrl(this.enlargedImageStepId, this.enlargedImageUrl);
+      this.enlargedImageUrl = '';
+      this.enlargedImageStepId = '';
+      this.enlargedImageScale = 1;
+      this.render();
+    }
+  }
+  
+  // 根据索引删除图片
+  public removeImageByIndex(stepId: string, index: number): void {
+    if (!this.currentGuide) return;
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step && step.images && index < step.images.length) {
+      step.images.splice(index, 1);
+      if (step.images.length === 0) {
+        step.images = undefined;
+      }
+      this.saveCurrentGuide();
+      this.render();
+    }
+  }
+  
+  // 根据 URL 删除图片
+  public removeImageByUrl(stepId: string, imageUrl: string): void {
+    if (!this.currentGuide) return;
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step && step.images) {
+      step.images = step.images.filter(img => img !== imageUrl);
+      if (step.images.length === 0) {
+        step.images = undefined;
+      }
+      this.saveCurrentGuide();
+    }
+  }
+
+  // 从编辑区域删除所有图片（直接更新数据并重新渲染）
+  public removeStepImageFromEditor(stepId: string): void {
+    if (this.currentGuide) {
+      const step = this.currentGuide.steps.find(s => s.id === stepId);
+      if (step) {
+        step.imageUrl = undefined;
+        step.images = undefined;
+        this.saveCurrentGuide();
+        this.render();
+      }
+    }
+  }
+
+  // 更新步骤图片数据（仅数据，不操作DOM）
+  private updateStepImageData(stepId: string, imageUrl: string): void {
+    if (!this.currentGuide) return;
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step) {
+      step.imageUrl = imageUrl;
+      this.saveCurrentGuide();
+      this.render();
+    }
+  }
+
+  // 更新指南名称
+  public updateGuideName(name: string): void {
+    if (!this.currentGuide) return;
+    this.currentGuide.name = name;
+    this.saveCurrentGuide();
+  }
+
+  // 返回知识库列表
+  public backToGuideList(): void {
+    this.currentGuide = null;
+    this.editingGuideId = '';
+    this.viewingGuideId = '';
+    this.render();
+  }
+  
+  // 处理知识库弹窗背景点击（编辑指南时显示确认弹窗）
+  public handleKnowledgeBaseBackdropClick(): void {
+    // 如果正在编辑指南，显示确认保存弹窗
+    if (this.currentGuide && !this.viewingGuideId) {
+      this.showGuideSaveConfirm = true;
+      this.render();
+    } else {
+      // 否则直接关闭
+      this.closeKnowledgeBase();
+    }
+  }
+  
+  // 取消保存确认弹窗
+  public cancelGuideSaveConfirm(): void {
+    this.showGuideSaveConfirm = false;
+    this.render();
+  }
+  
+  // 确认不保存，直接关闭
+  public confirmDiscardGuide(): void {
+    this.showGuideSaveConfirm = false;
+    this.closeKnowledgeBase();
+  }
+  
+  // 确认保存后关闭
+  public confirmSaveAndClose(): void {
+    this.saveGuideWithStatus();
+    this.showGuideSaveConfirm = false;
+    this.closeKnowledgeBase();
+  }
+  
+  // 关闭知识库
+  public closeKnowledgeBase(): void {
+    this.showKnowledgeBase = false;
+    this.currentGuide = null;
+    this.editingGuideId = '';
+    this.viewingGuideId = '';
+    this.knowledgeSearchKeyword = '';  // 清除搜索关键词
+    // 注意：不恢复 selectedDate，因为用户已经主动关闭了知识库
+    this.render();
+  }
+  
+  // 搜索知识库
+  public searchKnowledgeGuides(keyword: string): void {
+    this.knowledgeSearchKeyword = keyword;
+    // 不重新渲染整个页面，只更新指南列表
+    this.updateGuideList();
+  }
+  
+  // 更新指南列表（不重新渲染整个页面）
+  private updateGuideList(): void {
+    const guideListContainer = document.getElementById('guideListContainer');
+    if (!guideListContainer) return;
+    
+    const isDark = this.themeMode === 'dark';
+    const filteredGuides = this.getFilteredKnowledgeGuides();
+    const hasKeyword = this.knowledgeSearchKeyword.trim().length > 0;
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    
+    if (this.knowledgeGuides.length === 0) {
+      guideListContainer.innerHTML = `
+        <div class="text-center py-12">
+          <div class="text-6xl mb-4">📖</div>
+          <p class="${isDark ? 'text-gray-400' : 'text-gray-500'}">还没有任何指南</p>
+          <p class="text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-2">点击上方按钮创建你的第一个指南，或导入已有知识库</p>
+        </div>
+      `;
+      return;
+    }
+    
+    if (hasKeyword && filteredGuides.length === 0) {
+      guideListContainer.innerHTML = `
+        <div class="text-center py-12">
+          <svg class="w-16 h-16 mx-auto mb-4 ${isDark ? 'text-gray-600' : 'text-gray-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+          </svg>
+          <p class="${isDark ? 'text-gray-400' : 'text-gray-500'}">没有找到匹配的内容</p>
+          <p class="text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-2">尝试其他关键词</p>
+        </div>
+      `;
+      return;
+    }
+    
+    guideListContainer.innerHTML = `
+      ${hasKeyword ? `
+        <div class="mb-3 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">
+          找到 ${filteredGuides.length} 个匹配的指南
+        </div>
+      ` : ''}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        ${filteredGuides.map(guide => {
+          const matchInfo = this.getGuideMatchInfo(guide);
+          return `
+            <div class="p-4 min-h-[92px] ${isDark ? 'bg-gray-700 hover:bg-gray-650' : 'bg-gray-50 hover:bg-gray-100'} rounded-lg transition-all cursor-pointer group"
+                 onclick="planner.openGuideEdit('${guide.id}')">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3 flex-1 min-w-0">
+                  <span class="w-8 h-8 flex items-center justify-center bg-purple-100 dark:bg-purple-900/50 rounded-lg flex-shrink-0">
+                    <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                  </span>
+                  <div class="flex-1 min-w-0">
+                    <h3 class="font-medium ${textClass} truncate">${this.highlightKeyword(guide.name, this.knowledgeSearchKeyword)}</h3>
+                    <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${guide.steps.length} 个步骤 · 更新于 ${new Date(guide.updatedAt).toLocaleDateString()}</p>
+                    ${matchInfo ? `
+                      <p class="text-xs ${isDark ? 'text-purple-400' : 'text-purple-600'} mt-1 truncate">
+                        ${matchInfo}
+                      </p>
+                    ` : ''}
+                  </div>
+                </div>
+                <div class="flex items-center gap-2 flex-shrink-0">
+                  <button onclick="event.stopPropagation(); planner.deleteGuide('${guide.id}')"
+                          class="p-2 opacity-0 group-hover:opacity-100 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-all">
+                    <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                    </svg>
+                  </button>
+                  <svg class="w-5 h-5 ${isDark ? 'text-gray-500' : 'text-gray-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                  </svg>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+  
+  // 清除搜索
+  public clearKnowledgeSearch(): void {
+    this.knowledgeSearchKeyword = '';
+    this.render();
+  }
+  
+  // 获取过滤后的指南列表
+  private getFilteredKnowledgeGuides(): KnowledgeGuide[] {
+    const keyword = this.knowledgeSearchKeyword.trim().toLowerCase();
+    if (!keyword) {
+      return this.knowledgeGuides;
+    }
+    
+    return this.knowledgeGuides.filter(guide => {
+      // 匹配标题
+      if (guide.name.toLowerCase().includes(keyword)) {
+        return true;
+      }
+      // 匹配步骤标题或内容
+      return guide.steps.some(step => 
+        (step.title && step.title.toLowerCase().includes(keyword)) ||
+        (step.content && step.content.toLowerCase().includes(keyword))
+      );
+    });
+  }
+  
+  // 获取指南匹配信息（显示匹配的内容摘要）
+  private getGuideMatchInfo(guide: KnowledgeGuide): string | null {
+    const keyword = this.knowledgeSearchKeyword.trim().toLowerCase();
+    if (!keyword) {
+      return null;
+    }
+    
+    // 如果标题匹配，不需要显示额外信息
+    if (guide.name.toLowerCase().includes(keyword)) {
+      return null;
+    }
+    
+    // 查找匹配的步骤
+    const matchedSteps = guide.steps.filter(step => 
+      (step.title && step.title.toLowerCase().includes(keyword)) ||
+      (step.content && step.content.toLowerCase().includes(keyword))
+    );
+    
+    if (matchedSteps.length === 0) {
+      return null;
+    }
+    
+    // 返回第一个匹配的步骤信息
+    const step = matchedSteps[0];
+    const matchText = step.title || step.content || '';
+    const truncatedText = matchText.length > 50 ? matchText.substring(0, 50) + '...' : matchText;
+    return `匹配：${truncatedText}`;
+  }
+  
+  // 高亮关键词
+  private highlightKeyword(text: string, keyword: string): string {
+    if (!keyword.trim()) {
+      return text;
+    }
+    
+    const regex = new RegExp(`(${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    return text.replace(regex, '<mark class="bg-yellow-200 dark:bg-yellow-600 px-0.5 rounded">$1</mark>');
+  }
+
+  // 获取周标识（如 "2024-W01"），支持偏移量
+  private getWeekKey(offset: number = 0): string {
+    const date = new Date();
+    date.setDate(date.getDate() + offset * 7); // 偏移周数
+    const year = date.getFullYear();
+    const oneJan = new Date(year, 0, 1);
+    const days = Math.floor((date.getTime() - oneJan.getTime()) / 86400000);
+    const weekNum = Math.ceil((days + oneJan.getDay() + 1) / 7);
+    return `${year}-W${String(weekNum).padStart(2, '0')}`;
+  }
+
+  // 获取指定周的日期范围（用于显示）
+  private getWeekDateRange(offset: number = 0): { start: string; end: string; year: number; weekNum: number } {
+    const date = new Date();
+    date.setDate(date.getDate() + offset * 7);
+    
+    // 获取本周一
+    const day = date.getDay();
+    const diff = date.getDate() - day + (day === 0 ? -6 : 1);
+    const monday = new Date(date);
+    monday.setDate(diff);
+    
+    // 获取本周日
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    
+    const year = date.getFullYear();
+    const oneJan = new Date(year, 0, 1);
+    const days = Math.floor((date.getTime() - oneJan.getTime()) / 86400000);
+    const weekNum = Math.ceil((days + oneJan.getDay() + 1) / 7);
+    
+    return {
+      start: this.formatDate(monday),
+      end: this.formatDate(sunday),
+      year,
+      weekNum
+    };
+  }
+
+  // 获取月标识（如 "2024-01"），支持偏移量
+  private getMonthKey(offset: number = 0): string {
+    const date = new Date();
+    date.setMonth(date.getMonth() + offset);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  // 获取指定月的信息
+  private getMonthInfo(offset: number = 0): { year: number; month: number; key: string } {
+    const date = new Date();
+    date.setMonth(date.getMonth() + offset);
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1;
+    return {
+      year,
+      month,
+      key: `${year}-${String(month).padStart(2, '0')}`
+    };
+  }
+
+  // 获取年标识（如 "2024"），支持偏移量
+  private getYearKey(offset: number = 0): string {
+    return String(this.currentDate.getFullYear() + offset);
+  }
+
+  // 保存周总结文字
+  public saveWeeklySummaryNote(note: string): void {
+    const key = this.getWeekKey(this.viewingWeekOffset);
+    this.summaryNotes.weekly[key] = note;
+    this.saveSummaryNotes();
+  }
+
+  // 保存月总结文字
+  public saveMonthlySummaryNote(note: string): void {
+    const key = this.getMonthKey(this.viewingMonthOffset);
+    this.summaryNotes.monthly[key] = note;
+    this.saveSummaryNotes();
+  }
+
+  // 保存年度总结文字
+  public saveYearlySummaryNote(note: string): void {
+    const key = this.getYearKey(this.viewingYearOffset);
+    this.summaryNotes.yearly[key] = note;
+    this.saveSummaryNotes();
+  }
+
+  // 导航周总结
+  public navigateWeeklySummary(direction: number): void {
+    this.viewingWeekOffset += direction;
+    this.render();
+  }
+
+  // 导航月总结
+  public navigateMonthlySummary(direction: number): void {
+    this.viewingMonthOffset += direction;
+    this.render();
+  }
+
+  // 导航年度总结
+  public navigateYearlySummary(direction: number): void {
+    this.viewingYearOffset += direction;
+    this.render();
+  }
+
+  // 生成年份选项
+  private generateYearOptions(currentYear: number): string {
+    const thisYear = new Date().getFullYear();
+    let options = '';
+    for (let y = thisYear - 5; y <= thisYear + 1; y++) {
+      options += `<option value="${y}" ${y === currentYear ? 'selected' : ''}>${y}年</option>`;
+    }
+    return options;
+  }
+
+  // 生成周数选项
+  private generateWeekOptions(currentWeek: number): string {
+    let options = '';
+    for (let w = 1; w <= 53; w++) {
+      options += `<option value="${w}" ${w === currentWeek ? 'selected' : ''}>第${w}周</option>`;
+    }
+    return options;
+  }
+
+  // 生成月份选项
+  private generateMonthOptions(currentMonth: number): string {
+    const monthNames = ['一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月'];
+    let options = '';
+    for (let m = 1; m <= 12; m++) {
+      options += `<option value="${m}" ${m === currentMonth ? 'selected' : ''}>${monthNames[m - 1]}</option>`;
+    }
+    return options;
+  }
+
+  // 计算周偏移量（从年份和周数）
+  private calculateWeekOffset(year: number, weekNum: number): number {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    
+    // 获取当前周数
+    const oneJan = new Date(currentYear, 0, 1);
+    const days = Math.floor((now.getTime() - oneJan.getTime()) / 86400000);
+    const currentWeekNum = Math.ceil((days + oneJan.getDay() + 1) / 7);
+    
+    // 计算目标周与当前周的差值
+    const weeksDiff = (year - currentYear) * 52 + (weekNum - currentWeekNum);
+    return weeksDiff;
+  }
+
+  // 从选择器跳转到指定周
+  public jumpToWeekFromSelect(): void {
+    const yearSelect = document.getElementById('weekYearSelect') as HTMLSelectElement;
+    const weekSelect = document.getElementById('weekNumSelect') as HTMLSelectElement;
+    if (yearSelect && weekSelect) {
+      const year = parseInt(yearSelect.value);
+      const weekNum = parseInt(weekSelect.value);
+      this.viewingWeekOffset = this.calculateWeekOffset(year, weekNum);
+      this.render();
+    }
+  }
+
+  // 计算月偏移量
+  private calculateMonthOffset(year: number, month: number): number {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1;
+    return (year - currentYear) * 12 + (month - currentMonth);
+  }
+
+  // 从选择器跳转到指定月
+  public jumpToMonthFromSelect(): void {
+    const yearSelect = document.getElementById('monthYearSelect') as HTMLSelectElement;
+    const monthSelect = document.getElementById('monthNumSelect') as HTMLSelectElement;
+    if (yearSelect && monthSelect) {
+      const year = parseInt(yearSelect.value);
+      const month = parseInt(monthSelect.value);
+      this.viewingMonthOffset = this.calculateMonthOffset(year, month);
+      this.render();
+    }
+  }
+
+  // 从选择器跳转到指定年
+  public jumpToYearFromSelect(): void {
+    const yearSelect = document.getElementById('yearSelect') as HTMLSelectElement;
+    if (yearSelect) {
+      const year = parseInt(yearSelect.value);
+      this.viewingYearOffset = year - new Date().getFullYear();
+      this.render();
+    }
+  }
+
+  // 加载主题设置
+  private loadTheme(): BackgroundTheme {
+    const saved = localStorage.getItem('dailyPlannerTheme');
+    return saved ? saved as BackgroundTheme : 'blue';
+  }
+
+  // 保存主题设置
+  private saveTheme(theme: BackgroundTheme): void {
+    localStorage.setItem('dailyPlannerTheme', theme);
+  }
+
+  // 加载主题模式（明/暗）
+  private loadThemeMode(): ThemeMode {
+    const saved = localStorage.getItem('dailyPlannerThemeMode');
+    return saved ? saved as ThemeMode : 'light';
+  }
+
+  // 保存主题模式
+  private saveThemeMode(mode: ThemeMode): void {
+    localStorage.setItem('dailyPlannerThemeMode', mode);
+  }
+
+  // 应用主题模式到页面
+  private applyThemeMode(): void {
+    if (this.themeMode === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }
+
+  // 切换主题模式
+  private toggleThemeMode(): void {
+    this.themeMode = this.themeMode === 'light' ? 'dark' : 'light';
+    this.saveThemeMode(this.themeMode);
+    this.applyThemeMode();
+    this.render();
+  }
+
+  // 加载视图模式
+  private loadViewMode(): ViewMode {
+    const saved = localStorage.getItem('dailyPlannerViewMode');
+    return saved ? saved as ViewMode : 'month';
+  }
+
+  // 保存视图模式
+  private saveViewMode(mode: ViewMode): void {
+    localStorage.setItem('dailyPlannerViewMode', mode);
+  }
+
+  // 切换视图模式
+  private setViewMode(mode: ViewMode): void {
+    this.viewMode = mode;
+    this.saveViewMode(mode);
+    
+    // 如果切换到周视图，跳转到选中日期所在的周
+    if (mode === 'week' && this.selectedDate) {
+      this.currentDate = new Date(this.selectedDate);
+    }
+    
+    this.render();
+  }
+
+  // 加载纪念日
+  private loadAnniversaries(): Anniversary[] {
+    const saved = localStorage.getItem('dailyPlannerAnniversaries');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存纪念日
+  private saveAnniversaries(): void {
+    localStorage.setItem('dailyPlannerAnniversaries', JSON.stringify(this.anniversaries));
+  }
+
+  // ==================== 循环日程相关 ====================
+  
+  // 加载循环日程
+  private loadRecurringSchedules(): RecurringSchedule[] {
+    const saved = localStorage.getItem('dailyPlannerRecurringSchedules');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 保存循环日程
+  private saveRecurringSchedules(): void {
+    localStorage.setItem('dailyPlannerRecurringSchedules', JSON.stringify(this.recurringSchedules));
+  }
+
+  // 打开循环日程管理弹窗
+  public openRecurringScheduleModal(): void {
+    this.showRecurringScheduleModal = true;
+    this.editingRecurringSchedule = null;
+    this.render();
+  }
+
+  // 关闭循环日程管理弹窗
+  public closeRecurringScheduleModal(): void {
+    this.showRecurringScheduleModal = false;
+    this.editingRecurringSchedule = null;
+    this.render();
+  }
+
+  // 打开创建/编辑循环日程弹窗
+  public openEditRecurringSchedule(scheduleId?: string): void {
+    if (scheduleId) {
+      this.editingRecurringSchedule = this.recurringSchedules.find(s => s.id === scheduleId) || null;
+    } else {
+      // 创建新的循环日程
+      this.editingRecurringSchedule = {
+        id: '',
+        name: '',
+        time: '',
+        recurrenceType: 'weekly',
+        weekdays: [],
+        monthDay: 1,
+        createdAt: new Date().toISOString(),
+        startDate: this.formatDate(new Date())
+      };
+    }
+    this.render();
+  }
+
+  // 取消编辑循环日程
+  public cancelEditRecurringSchedule(): void {
+    this.editingRecurringSchedule = null;
+    this.render();
+  }
+
+  // 更新编辑中的循环日程
+  public updateEditingRecurringSchedule(field: string, value: unknown): void {
+    if (!this.editingRecurringSchedule) return;
+    if (field === 'name') {
+      this.editingRecurringSchedule.name = value as string;
+    } else if (field === 'time') {
+      this.editingRecurringSchedule.time = value as string;
+    } else if (field === 'recurrenceType') {
+      this.editingRecurringSchedule.recurrenceType = value as RecurrenceType;
+    } else if (field === 'monthDay') {
+      this.editingRecurringSchedule.monthDay = value as number;
+    } else if (field === 'startDate') {
+      this.editingRecurringSchedule.startDate = value as string;
+    }
+    this.render();
+  }
+
+  // 切换星期选择
+  public toggleWeekday(day: number): void {
+    if (!this.editingRecurringSchedule) return;
+    if (!this.editingRecurringSchedule.weekdays) {
+      this.editingRecurringSchedule.weekdays = [];
+    }
+    const index = this.editingRecurringSchedule.weekdays.indexOf(day);
+    if (index > -1) {
+      this.editingRecurringSchedule.weekdays.splice(index, 1);
+    } else {
+      this.editingRecurringSchedule.weekdays.push(day);
+      this.editingRecurringSchedule.weekdays.sort((a: number, b: number) => a - b);
+    }
+    this.render();
+  }
+
+  // 保存循环日程
+  public saveRecurringSchedule(): void {
+    if (!this.editingRecurringSchedule) return;
+    if (!this.editingRecurringSchedule.name.trim()) {
+      alert('请输入日程名称');
+      return;
+    }
+    
+    const isNew = !this.editingRecurringSchedule!.id;
+    if (isNew) {
+      this.editingRecurringSchedule!.id = Date.now().toString();
+      this.recurringSchedules.push(this.editingRecurringSchedule!);
+    } else {
+      const index = this.recurringSchedules.findIndex(s => s.id === this.editingRecurringSchedule!.id);
+      if (index > -1) {
+        this.recurringSchedules[index] = this.editingRecurringSchedule!;
+      }
+    }
+    
+    this.saveRecurringSchedules();
+    
+    // 更新或生成未来的任务
+    if (isNew) {
+      this.generateRecurringTasks(this.recurringSchedules[this.recurringSchedules.length - 1]);
+    } else {
+      // 编辑时，更新所有未来任务的名称和时间
+      this.updateRecurringTasks(this.editingRecurringSchedule!);
+    }
+    
+    this.editingRecurringSchedule = null;
+    this.render();
+  }
+
+  // 更新循环日程生成的未来任务
+  private updateRecurringTasks(schedule: RecurringSchedule): void {
+    const today = this.formatDate(new Date());
+    
+    // 遍历所有日期，找到属于该循环日程的任务并更新
+    Object.keys(this.tasks).forEach(dateKey => {
+      if (dateKey >= today) {
+        this.tasks[dateKey].forEach(task => {
+          if (task.recurringScheduleId === schedule.id) {
+            // 更新任务名称和时间
+            task.text = schedule.name;
+            task.time = schedule.time || '';
+          }
+        });
+      }
+    });
+    
+    this.saveTasks();
+  }
+
+  // 生成循环日程的任务（生成未来1年的任务）
+  private generateRecurringTasks(schedule: RecurringSchedule): void {
+    const startDate = parseLocalDate(schedule.startDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // 生成未来365天的任务（1年）
+    for (let i = 0; i < 365; i++) {
+      const date = new Date(startDate);
+      date.setDate(date.getDate() + i);
+      
+      if (date < today) continue;  // 只生成今天及以后的
+      
+      let shouldCreate = false;
+      
+      if (schedule.recurrenceType === 'weekly' && schedule.weekdays) {
+        const dayOfWeek = date.getDay();
+        shouldCreate = schedule.weekdays.includes(dayOfWeek);
+      } else if (schedule.recurrenceType === 'monthly' && schedule.monthDay) {
+        shouldCreate = date.getDate() === schedule.monthDay;
+      }
+      
+      if (shouldCreate) {
+        const dateKey = this.formatDate(date);
+        if (!this.tasks[dateKey]) {
+          this.tasks[dateKey] = [];
+        }
+        
+        // 检查是否已存在相同的任务
+        const existingTask = this.tasks[dateKey].find(t => 
+          t.text === schedule.name && t.recurringScheduleId === schedule.id
+        );
+        
+        if (!existingTask) {
+          const task: Task = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+            text: schedule.name,
+            date: dateKey,
+            completed: false,
+            priority: 'normal',
+            time: schedule.time || '',
+            tags: [],
+            recurringScheduleId: schedule.id  // 标记来源
+          };
+          this.tasks[dateKey].push(task);
+        }
+      }
+    }
+    
+    this.saveTasks();
+  }
+
+  // 补充生成循环日程任务（启动时调用，确保始终有足够的未来任务）
+  private regenerateRecurringTasks(): void {
+    if (this.recurringSchedules.length === 0) return;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = this.formatDate(today);
+    
+    // 计算未来1年的日期
+    const oneYearLater = new Date(today);
+    oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+    
+    // 遍历所有循环日程，检查并补充生成任务
+    this.recurringSchedules.forEach(schedule => {
+      const startDate = parseLocalDate(schedule.startDate);
+      
+      // 从今天开始检查到未来1年
+      for (let d = new Date(today); d <= oneYearLater; d.setDate(d.getDate() + 1)) {
+        let shouldCreate = false;
+        
+        if (schedule.recurrenceType === 'weekly' && schedule.weekdays) {
+          const dayOfWeek = d.getDay();
+          shouldCreate = schedule.weekdays.includes(dayOfWeek);
+        } else if (schedule.recurrenceType === 'monthly' && schedule.monthDay) {
+          shouldCreate = d.getDate() === schedule.monthDay;
+        }
+        
+        if (shouldCreate && d >= startDate) {
+          const dateKey = this.formatDate(d);
+          
+          // 检查是否已存在该循环日程的任务
+          if (!this.tasks[dateKey]) {
+            this.tasks[dateKey] = [];
+          }
+          
+          const existingTask = this.tasks[dateKey].find(t => 
+            t.recurringScheduleId === schedule.id
+          );
+          
+          if (!existingTask) {
+            const task: Task = {
+              id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+              text: schedule.name,
+              date: dateKey,
+              completed: false,
+              priority: 'normal',
+              time: schedule.time || '',
+              tags: [],
+              recurringScheduleId: schedule.id
+            };
+            this.tasks[dateKey].push(task);
+          }
+        }
+      }
+    });
+    
+    this.saveTasks();
+  }
+
+  // 删除循环日程及其生成的任务
+  public deleteRecurringSchedule(scheduleId: string): void {
+    if (!confirm('确定要删除这个循环日程吗？这将删除所有由该日程生成的未来任务。')) {
+      return;
+    }
+    
+    // 删除所有由该循环日程生成的未来任务
+    const today = this.formatDate(new Date());
+    Object.keys(this.tasks).forEach(dateKey => {
+      if (dateKey >= today) {
+        this.tasks[dateKey] = this.tasks[dateKey].filter(task => 
+          task.recurringScheduleId !== scheduleId
+        );
+        if (this.tasks[dateKey].length === 0) {
+          delete this.tasks[dateKey];
+        }
+      }
+    });
+    
+    // 从列表中移除
+    this.recurringSchedules = this.recurringSchedules.filter(s => s.id !== scheduleId);
+    this.saveRecurringSchedules();
+    this.saveTasks();
+    this.render();
+  }
+
+  // ==================== 备忘录相关 ====================
+  
+  // 加载备忘录（同步版本，用于兼容）
+  private loadMemos(): string[] {
+    const saved = localStorage.getItem('dailyPlannerMemos');
+    return saved ? JSON.parse(saved) : [];
+  }
+
+  // 加载备忘录（异步版本，优先使用 Electron 文件存储）
+  private async loadMemosAsync(): Promise<string[]> {
+    // 优先使用 Electron 文件存储
+    if (window.electronAPI?.loadMemosFile) {
+      try {
+        const data = await window.electronAPI.loadMemosFile();
+        if (data && data.length > 0) {
+          // 如果文件存储有数据，同步到 localStorage 作为备份
+          localStorage.setItem('dailyPlannerMemos', JSON.stringify(data));
+          return data;
+        }
+      } catch (error) {
+        console.error('从文件加载备忘录失败:', error);
+      }
+    }
+    // 回退到 localStorage
+    return this.loadMemos();
+  }
+
+  // 保存备忘录
+  private saveMemos(): void {
+    // 保存到 localStorage 作为备份
+    localStorage.setItem('dailyPlannerMemos', JSON.stringify(this.memos));
+    // 同时保存到 Electron 文件存储
+    if (window.electronAPI?.saveMemosFile) {
+      window.electronAPI.saveMemosFile(this.memos).catch(error => {
+        console.error('保存备忘录到文件失败:', error);
+      });
+    }
+  }
+
+  // 显示备忘录面板（悬停时调用，只在面板未显示时才渲染）
+  public openMemoPanelHover(): void {
+    // 取消关闭定时器
+    if (this.memoPanelCloseTimer) {
+      clearTimeout(this.memoPanelCloseTimer);
+      this.memoPanelCloseTimer = null;
+    }
+    if (!this.showMemoPanel) {
+      this.showMemoPanel = true;
+      this.render();
+    }
+  }
+
+  // 保持面板打开（鼠标进入面板时调用）
+  public keepMemoPanelOpen(): void {
+    // 取消关闭定时器
+    if (this.memoPanelCloseTimer) {
+      clearTimeout(this.memoPanelCloseTimer);
+      this.memoPanelCloseTimer = null;
+    }
+  }
+
+  // 检查是否需要关闭面板（鼠标离开容器时）
+  public checkCloseMemoPanel(event: MouseEvent): void {
+    // 如果正在编辑，不关闭
+    if (this.editingMemoIndex !== -1) {
+      return;
+    }
+    // 延迟关闭，给用户时间移动到面板
+    this.memoPanelCloseTimer = setTimeout(() => {
+      if (this.editingMemoIndex === -1) {
+        this.showMemoPanel = false;
+        this.render();
+      }
+    }, 100);
+  }
+
+  // 切换备忘录面板
+  public toggleMemoPanel(): void {
+    // 取消关闭定时器
+    if (this.memoPanelCloseTimer) {
+      clearTimeout(this.memoPanelCloseTimer);
+      this.memoPanelCloseTimer = null;
+    }
+    this.showMemoPanel = !this.showMemoPanel;
+    if (!this.showMemoPanel) {
+      this.editingMemoIndex = -1;
+      this.memoSearchKeyword = '';
+    }
+    this.render();
+  }
+
+  // 关闭备忘录面板（仅用于面板上的关闭按钮）
+  public closeMemoPanel(): void {
+    // 取消关闭定时器
+    if (this.memoPanelCloseTimer) {
+      clearTimeout(this.memoPanelCloseTimer);
+      this.memoPanelCloseTimer = null;
+    }
+    this.editingMemoIndex = -1;
+    this.memoSearchKeyword = '';
+    this.showMemoPanel = false;
+    this.render();
+  }
+
+  // 添加备忘录
+  public addMemo(): void {
+    this.editingMemoIndex = -2;  // -2 表示新增模式
+    this.memoSearchKeyword = '';
+    this.showMemoPanel = true;   // 确保面板显示
+    this.render();
+  }
+
+  // 保存备忘录内容
+  public saveMemoContent(content: string): void {
+    if (this.editingMemoIndex === -2) {
+      // 新增
+      if (content.trim()) {
+        this.memos.push(content.trim());
+      }
+    } else if (this.editingMemoIndex >= 0) {
+      // 编辑
+      if (content.trim()) {
+        this.memos[this.editingMemoIndex] = content.trim();
+      } else {
+        // 内容为空则删除
+        this.memos.splice(this.editingMemoIndex, 1);
+      }
+    }
+    this.saveMemos();
+    this.editingMemoIndex = -1;
+    this.render();
+  }
+
+  // 编辑备忘录
+  public editMemo(index: number): void {
+    this.editingMemoIndex = index;
+    this.render();
+  }
+
+  // 删除备忘录
+  public deleteMemo(index: number): void {
+    this.memos.splice(index, 1);
+    this.saveMemos();
+    this.render();
+  }
+
+  // 取消编辑
+  public cancelMemoEdit(): void {
+    this.editingMemoIndex = -1;
+    this.render();
+  }
+
+  // 搜索备忘录（仅局部更新列表，输入时不丢失焦点）
+  public searchMemos(keyword: string): void {
+    this.memoSearchKeyword = keyword;
+    this.updateMemoList();
+
+    const clearButton = document.getElementById('memo-search-clear');
+    clearButton?.classList.toggle('hidden', !keyword.trim());
+  }
+
+  public clearMemoSearch(): void {
+    this.memoSearchKeyword = '';
+    const searchInput = document.getElementById('memo-search-input') as HTMLInputElement | null;
+    if (searchInput) {
+      searchInput.value = '';
+      searchInput.focus();
+    }
+    document.getElementById('memo-search-clear')?.classList.add('hidden');
+    this.updateMemoList();
+  }
+
+  private getFilteredMemos(): Array<{ memo: string; index: number }> {
+    const keyword = this.memoSearchKeyword.trim().toLocaleLowerCase('zh-CN');
+    return this.memos
+      .map((memo, index) => ({ memo, index }))
+      .filter(({ memo }) => !keyword || memo.toLocaleLowerCase('zh-CN').includes(keyword));
+  }
+
+  private highlightMemoKeyword(text: string): string {
+    const keyword = this.memoSearchKeyword.trim();
+    if (!keyword) return this.escapeHtml(text);
+
+    const escapedPattern = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(${escapedPattern})`, 'gi');
+    return text.split(regex).map(part =>
+      part.toLocaleLowerCase('zh-CN') === keyword.toLocaleLowerCase('zh-CN')
+        ? `<mark class="bg-amber-200 dark:bg-amber-700 px-0.5 rounded">${this.escapeHtml(part)}</mark>`
+        : this.escapeHtml(part)
+    ).join('');
+  }
+
+  private updateMemoList(): void {
+    const memoList = document.getElementById('memo-list');
+    if (memoList) memoList.innerHTML = this.generateMemoListHTML();
+  }
+
+  // 切换主题
+  private setTheme(theme: BackgroundTheme): void {
+    this.currentTheme = theme;
+    this.saveTheme(theme);
+    this.showThemeMenu = false;
+    this.render();
+  }
+
+  // 切换主题菜单显示/隐藏
+  private toggleThemeMenu(): void {
+    this.showThemeMenu = !this.showThemeMenu;
+
+    // 打开主题菜单时，关闭其他弹窗
+    if (this.showThemeMenu) {
+      this.showNotificationPanel = false;
+      this.showMoreMenu = false;
+    }
+
+    this.render();
+  }
+
+  // 格式化日期为 YYYY-MM-DD
+  private formatDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  private escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // 获取当前时间 HH:MM
+  private getCurrentTime(): string {
+    const now = new Date();
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    return `${hours}:${minutes}`;
+  }
+
+  // 获取当前显示日期的任务
+  private getDisplayDate(): Date | null {
+    // 优先使用选中的日期，如果没有则使用悬停的日期
+    return this.selectedDate || this.hoveredDate;
+  }
+
+  // 获取选中日期的任务
+  private getSelectedDateTasks(): Task[] {
+    const displayDate = this.getDisplayDate();
+    if (!displayDate) return [];
+    const dateKey = this.formatDate(displayDate);
+    return this.tasks[dateKey] || [];
+  }
+
+  // 获取本月的统计数据
+  private getMonthlyStats(): MonthlyStats {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+
+    let total = 0;
+    let completed = 0;
+
+    if (this.viewMode === 'month') {
+      // 月视图：统计整月
+      const lastDay = new Date(year, month + 1, 0).getDate();
+
+      for (let day = 1; day <= lastDay; day++) {
+        const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        const dayTasks = this.tasks[dateKey] || [];
+
+        total += dayTasks.length;
+        completed += dayTasks.filter(task => task.completed).length;
+      }
+    } else if (this.viewMode === 'week') {
+      // 周视图：统计本周（周一开始）
+      const weekStart = new Date(this.currentDate);
+      const dayOfWeek = weekStart.getDay();
+      const adjustedDayOfWeek = (dayOfWeek + 6) % 7;
+      weekStart.setDate(weekStart.getDate() - adjustedDayOfWeek);
+
+      for (let i = 0; i < 7; i++) {
+        const date = new Date(weekStart);
+        date.setDate(date.getDate() + i);
+        const dateKey = this.formatDate(date);
+        const dayTasks = this.tasks[dateKey] || [];
+
+        total += dayTasks.length;
+        completed += dayTasks.filter(task => task.completed).length;
+      }
+    } else {
+      // 日视图：统计当天
+      const dateKey = this.formatDate(this.currentDate);
+      const dayTasks = this.tasks[dateKey] || [];
+
+      total = dayTasks.length;
+      completed = dayTasks.filter(task => task.completed).length;
+    }
+
+    const pending = total - completed;
+    const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+    return { total, completed, pending, percentage };
+  }
+
+  // 获取当前视图的所有任务（根据筛选条件）
+  private getFilteredMonthlyTasks(): Array<{ date: string; task: Task }> {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+
+    const allTasks: Array<{ date: string; task: Task }> = [];
+
+    let dateKeys: string[] = [];
+
+    if (this.viewMode === 'month') {
+      // 月视图：获取整月日期
+      const lastDay = new Date(year, month + 1, 0).getDate();
+      for (let day = 1; day <= lastDay; day++) {
+        dateKeys.push(`${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
+      }
+    } else if (this.viewMode === 'week') {
+      // 周视图：获取本周日期（周一开始）
+      const weekStart = new Date(this.currentDate);
+      const dayOfWeek = weekStart.getDay();
+      const adjustedDayOfWeek = (dayOfWeek + 6) % 7;
+      weekStart.setDate(weekStart.getDate() - adjustedDayOfWeek);
+
+      for (let i = 0; i < 7; i++) {
+        const date = new Date(weekStart);
+        date.setDate(date.getDate() + i);
+        dateKeys.push(this.formatDate(date));
+      }
+    } else {
+      // 日视图：获取当天日期
+      dateKeys.push(this.formatDate(this.currentDate));
+    }
+
+    dateKeys.forEach(dateKey => {
+      const dayTasks = this.tasks[dateKey] || [];
+
+      dayTasks.forEach(task => {
+        if (this.monthlyFilter === 'all') {
+          allTasks.push({ date: dateKey, task });
+        } else if (this.monthlyFilter === 'completed' && task.completed) {
+          allTasks.push({ date: dateKey, task });
+        } else if (this.monthlyFilter === 'pending' && !task.completed) {
+          allTasks.push({ date: dateKey, task });
+        }
+      });
+    });
+
+    return allTasks;
+  }
+
+  // 添加任务
+  private addTask(text: string, priority: TaskPriority = 'normal', tags: string[] = [], customTime?: string, guideId?: string): void {
+    // 验证：不允许添加空任务或只有空格的任务
+    if (!text || text.trim() === '') {
+      alert('请输入任务内容');
+      return;
+    }
+
+    if (!this.selectedDate) return;
+    
+    const dateKey = this.formatDate(this.selectedDate);
+    
+    if (!this.tasks[dateKey]) {
+      this.tasks[dateKey] = [];
+    }
+    this.tasks[dateKey].push({
+      id: Date.now().toString(),
+      text: text.trim(), // 去除首尾空格
+      completed: false,
+      date: dateKey,
+      time: customTime || this.getCurrentTime(),
+      priority: priority,
+      tags: tags,
+      guideId: guideId
+    });
+    this.saveTasks();
+    this.refreshTaskViews(dateKey);
+  }
+
+  // 更新任务优先级
+  private updateTaskPriority(taskId: string, priority: TaskPriority): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task) {
+        task.priority = priority;
+        this.saveTasks();
+        this.refreshTaskViews(dateKey);
+      }
+    }
+  }
+
+  // 删除任务
+  private deleteTask(taskId: string): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      this.tasks[dateKey] = this.tasks[dateKey].filter(task => task.id !== taskId);
+      this.saveTasks();
+      this.refreshTaskViews(dateKey);
+    }
+  }
+
+  // 切换任务完成状态
+  private toggleTask(taskId: string): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task) {
+        task.completed = !task.completed;
+        this.saveTasks();
+        // 播放提示音
+        if (task.completed) {
+          this.playNotificationSound('success');
+        }
+        this.refreshTaskViews(dateKey);
+      }
+    }
+  }
+
+  // 打开复制任务弹窗
+  private openCopyModal(taskId: string): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task) {
+        this.copyingTask = task;
+        this.selectedCopyDates = new Set();
+        this.showCopyModal = true;
+
+        // 关闭其他弹窗并清除悬停状态
+        this.showStatsModal = false;
+        this.showThemeMenu = false;
+        this.hoveredDate = null;
+
+        this.render();
+      }
+    }
+  }
+
+  // 关闭复制任务弹窗
+  private closeCopyModal(): void {
+    this.showCopyModal = false;
+    this.copyingTask = null;
+    this.selectedCopyDates = new Set();
+    this.render();
+  }
+
+  // 切换复制的日期选中状态
+  private toggleCopyDate(date: string): void {
+    if (this.selectedCopyDates.has(date)) {
+      this.selectedCopyDates.delete(date);
+    } else {
+      this.selectedCopyDates.add(date);
+    }
+    this.render();
+  }
+
+  // 全选/取消全选本月日期
+  private toggleAllMonthDates(selectAll: boolean): void {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+    const lastDay = new Date(year, month + 1, 0).getDate();
+
+    this.selectedCopyDates.clear();
+
+    if (selectAll) {
+      for (let day = 1; day <= lastDay; day++) {
+        const dateKey = this.formatDate(new Date(year, month, day));
+        // 跳过当前选中的日期（避免重复）
+        if (this.selectedDate && this.formatDate(this.selectedDate) !== dateKey) {
+          this.selectedCopyDates.add(dateKey);
+        }
+      }
+    }
+
+    this.render();
+  }
+
+  // 全选工作日（考虑调休）
+  private selectWorkdays(): void {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+    const lastDay = new Date(year, month + 1, 0).getDate();
+
+    this.selectedCopyDates.clear();
+
+    for (let day = 1; day <= lastDay; day++) {
+      const date = new Date(year, month, day);
+      // 使用 isActualWorkday 方法，考虑调休情况
+      const isWorkday = this.isActualWorkday(date);
+
+      if (isWorkday) {
+        const dateKey = this.formatDate(date);
+        // 跳过当前选中的日期（避免重复）
+        if (this.selectedDate && this.formatDate(this.selectedDate) !== dateKey) {
+          this.selectedCopyDates.add(dateKey);
+        }
+      }
+    }
+
+    this.render();
+  }
+
+  // 确认复制任务
+  private confirmCopyTask(): void {
+    if (!this.copyingTask || this.selectedCopyDates.size === 0) {
+      alert('请至少选择一个日期');
+      return;
+    }
+
+    // 复制任务到选中的日期
+    this.selectedCopyDates.forEach(date => {
+      if (!this.tasks[date]) {
+        this.tasks[date] = [];
+      }
+      this.tasks[date].push({
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+        text: this.copyingTask!.text,
+        completed: false,
+        date,
+        time: this.getCurrentTime(),
+        priority: this.copyingTask!.priority,
+        tags: this.copyingTask!.tags || []
+      });
+    });
+
+    this.saveTasks();
+    this.closeCopyModal();
+    this.updateTaskPanel();
+    this.updateCalendarIndicators();
+  }
+
+  // 拖拽任务开始
+  private draggedTaskId: string | null = null;
+
+  private onTaskDragStart(event: DragEvent, taskId: string): void {
+    this.draggedTaskId = taskId;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', taskId);
+    }
+  }
+
+  // 拖拽任务到日期
+  private onDateDrop(event: DragEvent, targetDate: Date): void {
+    event.preventDefault();
+    if (!this.draggedTaskId || !this.selectedDate) return;
+
+    const sourceDateKey = this.formatDate(this.selectedDate);
+    const targetDateKey = this.formatDate(targetDate);
+
+    if (sourceDateKey === targetDateKey) return;
+
+    // 找到并移动任务
+    const taskIndex = this.tasks[sourceDateKey]?.findIndex(t => t.id === this.draggedTaskId);
+    if (taskIndex === undefined || taskIndex === -1) return;
+
+    const task = this.tasks[sourceDateKey].splice(taskIndex, 1)[0];
+    task.date = targetDateKey;
+
+    if (!this.tasks[targetDateKey]) {
+      this.tasks[targetDateKey] = [];
+    }
+    this.tasks[targetDateKey].push(task);
+
+    this.saveTasks();
+    this.draggedTaskId = null;
+    this.refreshTaskViews(sourceDateKey, targetDateKey);
+  }
+
+  // 搜索任务
+  private searchTasks(query: string): Array<{ date: string; task: Task }> {
+    const results: Array<{ date: string; task: Task }> = [];
+    const lowerQuery = query.toLowerCase();
+
+    Object.entries(this.tasks).forEach(([date, tasks]) => {
+      tasks.forEach(task => {
+        if (task.text.toLowerCase().includes(lowerQuery)) {
+          results.push({ date, task });
+        }
+      });
+    });
+
+    // 按日期倒序排列
+    results.sort((a, b) => b.date.localeCompare(a.date));
+    return results.slice(0, 50); // 最多返回50条
+  }
+
+  // 切换搜索面板
+  private toggleSearchPanel(): void {
+    this.showSearchPanel = !this.showSearchPanel;
+    if (!this.showSearchPanel) {
+      this.searchQuery = '';
+    }
+    this.render();
+  }
+
+  // 执行搜索（不重新渲染整个面板，只更新结果列表）
+  private performSearch(query: string): void {
+    this.searchQuery = query;
+    this.updateSearchResults();
+  }
+
+  // 更新搜索结果（DOM 操作，避免输入框失焦）
+  private updateSearchResults(): void {
+    const resultsContainer = document.getElementById('searchResults');
+    if (!resultsContainer) return;
+
+    const isDark = this.themeMode === 'dark';
+    const textClass = isDark ? 'text-gray-200' : 'text-gray-700';
+    const results = this.searchQuery ? this.searchTasks(this.searchQuery) : [];
+
+    if (results.length > 0) {
+      resultsContainer.innerHTML = results.map(({ date, task }) => `
+        <div class="flex items-center gap-3 p-3 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-50 hover:bg-gray-100'} rounded-lg cursor-pointer transition-colors"
+             onclick="planner.jumpToDate('${date}')">
+          <input type="checkbox" ${task.completed ? 'checked' : ''} class="pointer-events-none" disabled>
+          <span class="flex-1 ${task.completed ? 'line-through text-gray-400' : textClass}">${task.text}</span>
+          <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${date}</span>
+          <span class="text-xs px-2 py-1 rounded ${getPriorityConfig(task.priority).bgColor} ${getPriorityConfig(task.priority).color}">${getPriorityConfig(task.priority).shortLabel}</span>
+        </div>
+      `).join('');
+    } else if (this.searchQuery) {
+      resultsContainer.innerHTML = `<p class="text-center text-gray-400 py-8">未找到匹配的任务</p>`;
+    } else {
+      resultsContainer.innerHTML = `<p class="text-center text-gray-400 py-8">输入关键词搜索任务</p>`;
+    }
+  }
+
+  // 跳转到日期
+  private jumpToDate(dateStr: string): void {
+    const date = parseLocalDate(dateStr);
+    this.currentDate = new Date(date);
+    this.selectedDate = new Date(date);
+    this.showSearchPanel = false;
+    this.searchQuery = '';
+    this.loadHolidaysForYear(date.getFullYear());
+    this.render();
+  }
+
+  // 导出数据为JSON
+  private exportToJSON(): void {
+    const data = {
+      version: APP_VERSION,
+      tasks: this.tasks,
+      anniversaries: this.anniversaries,
+      exportDate: new Date().toISOString()
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `daily-planner-${this.formatDate(new Date())}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // 从 JSON 导入数据
+  private importFromJSON(): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e: Event) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = JSON.parse(event.target?.result as string);
+          
+          // 验证数据格式
+          if (!data.tasks || typeof data.tasks !== 'object') {
+            alert('无效的数据文件：缺少任务数据');
+            return;
+          }
+
+          // 确认是否覆盖现有数据
+          const confirmMsg = '导入将覆盖现有数据，是否继续？\n\n建议先导出当前数据备份。';
+          if (!confirm(confirmMsg)) return;
+
+          // 导入数据
+          this.tasks = data.tasks || {};
+          this.anniversaries = data.anniversaries || [];
+          this.saveTasks();
+          this.saveAnniversaries();
+          
+          // 清除节假日缓存，重新加载
+          this.holidayCache = {};
+          this.loadHolidaysForYear(this.currentDate.getFullYear());
+          
+          alert('数据导入成功！');
+          this.render();
+        } catch (error) {
+          alert('数据导入失败：文件格式错误');
+          console.error('Import error:', error);
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+
+  // 导出数据为CSV
+  private exportToCSV(): void {
+    let csv = '日期,任务内容,状态,优先级,时间\n';
+    
+    Object.entries(this.tasks).forEach(([date, tasks]) => {
+      tasks.forEach(task => {
+        const status = task.completed ? '已完成' : '未完成';
+        const priorityLabel = getPriorityConfig(task.priority).label;
+        csv += `${date},"${task.text}",${status},${priorityLabel},${task.time}\n`;
+      });
+    });
+
+    const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `daily-planner-${this.formatDate(new Date())}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // 获取年度统计
+  private getYearlyStats(): { total: number; completed: number; byMonth: { month: number; total: number; completed: number }[] } {
+    const year = this.currentDate.getFullYear();
+    let total = 0;
+    let completed = 0;
+    const byMonth: { month: number; total: number; completed: number }[] = [];
+
+    for (let month = 0; month < 12; month++) {
+      let monthTotal = 0;
+      let monthCompleted = 0;
+      const lastDay = new Date(year, month + 1, 0).getDate();
+
+      for (let day = 1; day <= lastDay; day++) {
+        const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        const dayTasks = this.tasks[dateKey] || [];
+        monthTotal += dayTasks.length;
+        monthCompleted += dayTasks.filter(t => t.completed).length;
+      }
+
+      byMonth.push({ month: month + 1, total: monthTotal, completed: monthCompleted });
+      total += monthTotal;
+      completed += monthCompleted;
+    }
+
+    return { total, completed, byMonth };
+  }
+
+  // 获取周统计数据（详细版）
+  private getWeeklyStats(offset: number = 0): WeeklyStats {
+    const today = new Date();
+    // 应用周偏移
+    today.setDate(today.getDate() + offset * 7);
+    
+    const dayOfWeek = today.getDay();
+    const adjustedDayOfWeek = (dayOfWeek + 6) % 7; // 周一为第一天
+    
+    // 本周开始日期（周一）
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - adjustedDayOfWeek);
+    
+    const dayNames = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+    const byDay: { date: string; dayName: string; total: number; completed: number }[] = [];
+    
+    let total = 0;
+    let completed = 0;
+    
+    for (let i = 0; i < 7; i++) {
+      const date = new Date(weekStart);
+      date.setDate(weekStart.getDate() + i);
+      const dateKey = this.formatDate(date);
+      const dayTasks = this.tasks[dateKey] || [];
+      
+      const dayTotal = dayTasks.length;
+      const dayCompleted = dayTasks.filter(t => t.completed).length;
+      
+      byDay.push({
+        date: dateKey,
+        dayName: dayNames[i],
+        total: dayTotal,
+        completed: dayCompleted
+      });
+      
+      total += dayTotal;
+      completed += dayCompleted;
+    }
+    
+    const pending = total - completed;
+    const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+    
+    // 计算上周数据（相对于当前查看的周）
+    const lastWeekStart = new Date(weekStart);
+    lastWeekStart.setDate(weekStart.getDate() - 7);
+    
+    let lastWeekTotal = 0;
+    let lastWeekCompleted = 0;
+    
+    for (let i = 0; i < 7; i++) {
+      const date = new Date(lastWeekStart);
+      date.setDate(lastWeekStart.getDate() + i);
+      const dateKey = this.formatDate(date);
+      const dayTasks = this.tasks[dateKey] || [];
+      lastWeekTotal += dayTasks.length;
+      lastWeekCompleted += dayTasks.filter(t => t.completed).length;
+    }
+    
+    const lastWeekPercentage = lastWeekTotal > 0 ? Math.round((lastWeekCompleted / lastWeekTotal) * 100) : 0;
+    const improvement = percentage - lastWeekPercentage;
+    
+    // 连续打卡天数
+    const streakDays = this.getStreakDays();
+    
+    return {
+      total,
+      completed,
+      pending,
+      percentage,
+      byDay,
+      lastWeekPercentage,
+      improvement,
+      streakDays
+    };
+  }
+
+  // 获取连续打卡天数
+  private getStreakDays(): number {
+    const today = this.formatDate(new Date());
+    let streak = 0;
+    let checkDate = new Date();
+    
+    // 从今天开始往前检查
+    while (true) {
+      const dateKey = this.formatDate(checkDate);
+      const dayTasks = this.tasks[dateKey] || [];
+      const hasCompletedTask = dayTasks.some(t => t.completed);
+      
+      if (hasCompletedTask) {
+        streak++;
+        checkDate.setDate(checkDate.getDate() - 1);
+      } else if (dateKey === today) {
+        // 今天还没完成任务，继续检查昨天
+        checkDate.setDate(checkDate.getDate() - 1);
+      } else {
+        break;
+      }
+    }
+    
+    return streak;
+  }
+
+  // 获取最长连续打卡天数
+  private getLongestStreak(): number {
+    const allDates = Object.keys(this.tasks).sort();
+    if (allDates.length === 0) return 0;
+    
+    let longestStreak = 0;
+    let currentStreak = 0;
+    let prevDate: Date | null = null;
+    
+    for (const dateKey of allDates) {
+      const dayTasks = this.tasks[dateKey] || [];
+      const hasCompletedTask = dayTasks.some(t => t.completed);
+      
+      if (hasCompletedTask) {
+        const currentDate = parseLocalDate(dateKey);
+        
+        if (prevDate) {
+          const diffDays = Math.floor((currentDate.getTime() - prevDate.getTime()) / (1000 * 60 * 60 * 24));
+          if (diffDays === 1) {
+            currentStreak++;
+          } else {
+            currentStreak = 1;
+          }
+        } else {
+          currentStreak = 1;
+        }
+        
+        prevDate = currentDate;
+        longestStreak = Math.max(longestStreak, currentStreak);
+      }
+    }
+    
+    return longestStreak;
+  }
+
+  // 获取扩展的年度统计
+  private getYearlyStatsExtended(offset: number = 0): YearlyStatsExtended {
+    const year = this.currentDate.getFullYear() + offset;
+    let total = 0;
+    let completed = 0;
+    let totalDays = 0;
+    let daysWithTasks = 0;
+    
+    const byMonth: { month: number; total: number; completed: number; percentage: number }[] = [];
+    let busiestMonth: { month: number; count: number } | null = null;
+    let mostProductiveMonth: { month: number; rate: number } | null = null;
+    
+    for (let month = 0; month < 12; month++) {
+      let monthTotal = 0;
+      let monthCompleted = 0;
+      const lastDay = new Date(year, month + 1, 0).getDate();
+      
+      for (let day = 1; day <= lastDay; day++) {
+        const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        const dayTasks = this.tasks[dateKey] || [];
+        monthTotal += dayTasks.length;
+        monthCompleted += dayTasks.filter(t => t.completed).length;
+        
+        if (dayTasks.length > 0) {
+          daysWithTasks++;
+        }
+        totalDays++;
+      }
+      
+      const monthPercentage = monthTotal > 0 ? Math.round((monthCompleted / monthTotal) * 100) : 0;
+      byMonth.push({ month: month + 1, total: monthTotal, completed: monthCompleted, percentage: monthPercentage });
+      
+      total += monthTotal;
+      completed += monthCompleted;
+      
+      // 更新最忙碌月份
+      if (!busiestMonth || monthTotal > busiestMonth.count) {
+        busiestMonth = { month: month + 1, count: monthTotal };
+      }
+      
+      // 更新最高效月份（至少有5个任务才计入）
+      if (monthTotal >= 5 && (!mostProductiveMonth || monthPercentage > mostProductiveMonth.rate)) {
+        mostProductiveMonth = { month: month + 1, rate: monthPercentage };
+      }
+    }
+    
+    const pending = total - completed;
+    const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const avgDailyTasks = daysWithTasks > 0 ? Math.round(total / daysWithTasks * 10) / 10 : 0;
+    
+    return {
+      total,
+      completed,
+      pending,
+      percentage,
+      byMonth,
+      busiestMonth,
+      mostProductiveMonth,
+      streakDays: this.getStreakDays(),
+      longestStreak: this.getLongestStreak(),
+      avgDailyTasks
+    };
+  }
+
+  // 添加纪念日
+  private addAnniversary(name: string, month: number, day: number, type: 'birthday' | 'anniversary' | 'custom', isLunar: boolean = false): void {
+    this.anniversaries.push({
+      id: Date.now().toString(),
+      name,
+      month,
+      day,
+      type,
+      isLunar
+    });
+    this.saveAnniversaries();
+    this.render();
+  }
+
+  // 处理添加纪念日（带验证）
+  private handleAddAnniversary(): void {
+    const nameInput = document.getElementById('anniversaryName') as HTMLInputElement;
+    const monthInput = document.getElementById('anniversaryMonth') as HTMLInputElement;
+    const dayInput = document.getElementById('anniversaryDay') as HTMLInputElement;
+    const typeSelect = document.getElementById('anniversaryType') as HTMLSelectElement;
+    const calendarSelect = document.getElementById('anniversaryCalendar') as HTMLSelectElement;
+
+    const name = nameInput.value.trim();
+    const month = parseInt(monthInput.value);
+    const day = parseInt(dayInput.value);
+    const type = typeSelect.value as 'birthday' | 'anniversary' | 'custom';
+    const isLunar = calendarSelect.value === 'lunar';
+
+    // 验证输入
+    if (!name) {
+      alert('请输入纪念日名称');
+      nameInput.focus();
+      return;
+    }
+
+    if (isNaN(month) || month < 1 || month > 12) {
+      alert('请输入有效的月份（1-12）');
+      monthInput.focus();
+      return;
+    }
+
+    if (isNaN(day) || day < 1 || day > 31) {
+      alert('请输入有效的日期（1-31）');
+      dayInput.focus();
+      return;
+    }
+
+    // 公历日期验证
+    if (!isLunar) {
+      const testDate = new Date(2024, month - 1, day);
+      if (testDate.getMonth() !== month - 1) {
+        alert('该日期不存在，请检查月份和日期');
+        return;
+      }
+    } else {
+      // 农历日期验证（农历月份1-12，日期1-30）
+      if (day > 30) {
+        alert('农历日期最大为30天');
+        return;
+      }
+    }
+
+    this.addAnniversary(name, month, day, type, isLunar);
+
+    // 清空输入框
+    nameInput.value = '';
+    monthInput.value = '';
+    dayInput.value = '';
+    typeSelect.value = 'birthday';
+    calendarSelect.value = 'solar';
+  }
+
+  // 删除纪念日
+  private deleteAnniversary(id: string): void {
+    this.anniversaries = this.anniversaries.filter(a => a.id !== id);
+    this.saveAnniversaries();
+    this.render();
+  }
+
+  // 检查日期是否匹配纪念日（支持农历）
+  private checkAnniversaryMatch(date: Date, anniversary: Anniversary): boolean {
+    if (anniversary.isLunar) {
+      // 农历纪念日：将当前日期转换为农历进行比较
+      const solar = Solar.fromDate(date);
+      const lunar = solar.getLunar();
+      return lunar.getMonth() === anniversary.month && lunar.getDay() === anniversary.day;
+    } else {
+      // 公历纪念日：直接比较月日
+      return date.getMonth() + 1 === anniversary.month && date.getDate() === anniversary.day;
+    }
+  }
+
+  // 获取匹配当前日期的纪念日列表
+  private getMatchingAnniversaries(date: Date): Anniversary[] {
+    return this.anniversaries.filter(a => this.checkAnniversaryMatch(date, a));
+  }
+
+  // 切换月份
+  private changeMonth(delta: number): void {
+    this.currentDate.setMonth(this.currentDate.getMonth() + delta);
+    if (this.selectedDate) {
+      this.selectedDate = new Date(this.currentDate);
+    }
+    // 加载新月份对应年份的节假日数据
+    this.loadHolidaysForYear(this.currentDate.getFullYear());
+    this.showMonthPicker = false;
+    this.render();
+  }
+
+  // 切换月份选择器显示
+  private toggleMonthPicker(): void {
+    this.showMonthPicker = !this.showMonthPicker;
+    if (this.showMonthPicker) {
+      // 打开选择器时初始化选中年份
+      this.selectedPickerYear = this.currentDate.getFullYear();
+      this.yearRangeOffset = 0;
+    }
+    this.render();
+  }
+
+  // 选择年份（只更新选择器中的年份，不关闭）
+  private selectPickerYear(year: number): void {
+    this.selectedPickerYear = year;
+    this.render();
+  }
+
+  // 选择月份（真正改变日历并关闭选择器）
+  private selectPickerMonth(month: number): void {
+    this.currentDate = new Date(this.selectedPickerYear, month, 1);
+    if (this.selectedDate) {
+      this.selectedDate = new Date(this.selectedPickerYear, month, 1);
+    }
+    this.loadHolidaysForYear(this.selectedPickerYear);
+    this.showMonthPicker = false;
+    this.render();
+  }
+
+  // 生成年份选择器
+  private generateYearSelectorHTML(currentYear: number, isDark: boolean): string {
+    const years: number[] = [];
+    for (let y = currentYear - 5; y <= currentYear + 5; y++) {
+      years.push(y);
+    }
+    
+    return `
+      <div class="flex items-center gap-2 mb-3">
+        <button onclick="planner.shiftYearRange(-10)"
+                class="p-1 ${isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-200'} rounded transition-colors">
+          <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"/>
+          </svg>
+        </button>
+        <div class="flex gap-1 flex-1 justify-center">
+          ${years.slice(0, 5).map(y => `
+            <button onclick="planner.selectYearAndMonth(${y}, ${this.currentDate.getMonth()})"
+                    class="px-2 py-1 text-sm rounded transition-colors ${y === currentYear 
+                      ? 'bg-blue-500 text-white' 
+                      : (isDark ? 'hover:bg-gray-600 text-gray-300' : 'hover:bg-gray-200 text-gray-700')}">
+              ${y}
+            </button>
+          `).join('')}
+        </div>
+        <button onclick="planner.shiftYearRange(10)"
+                class="p-1 ${isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-200'} rounded transition-colors">
+          <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7m-8-14l7 7-7 7"/>
+          </svg>
+        </button>
+      </div>
+    `;
+  }
+
+  // 跳转到今天
+  private jumpToToday(): void {
+    const today = new Date();
+    
+    // 根据视图模式设置 currentDate
+    if (this.viewMode === 'month') {
+      // 月视图：设置为月份第一天
+      this.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+    } else {
+      // 周视图和日视图：设置为今天
+      this.currentDate = new Date(today);
+    }
+    
+    this.selectedDate = new Date(today);
+    this.hoveredDate = null;
+    this.loadHolidaysForYear(today.getFullYear());
+    this.render();
+  }
+
+  // 编辑任务
+  private editTask(taskId: string, newText: string): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task && newText.trim()) {
+        task.text = newText.trim();
+        this.saveTasks();
+        this.refreshTaskViews(dateKey);
+      }
+    }
+  }
+
+  // 开始编辑任务（显示编辑输入框）
+  private startEditTask(taskId: string): void {
+    if (!this.selectedDate) return;
+    const dateKey = this.formatDate(this.selectedDate);
+    if (this.tasks[dateKey]) {
+      const task = this.tasks[dateKey].find(t => t.id === taskId);
+      if (task) {
+        // 只在任务面板中查找任务元素，避免找到日历中的任务
+        const taskPanel = document.querySelector('.task-panel');
+        const taskElement = taskPanel ? taskPanel.querySelector(`[data-task-id="${taskId}"]`) : null;
+        if (taskElement) {
+          // 禁用拖拽，避免干扰文本选择
+          (taskElement as HTMLElement).setAttribute('draggable', 'false');
+          
+          // 隐藏左边框
+          (taskElement as HTMLElement).style.borderLeftWidth = '0';
+          
+          // 隐藏操作按钮
+          const actionsDiv = taskElement.querySelector('.task-actions');
+          if (actionsDiv) {
+            (actionsDiv as HTMLElement).style.display = 'none';
+          }
+          
+          const textSpan = taskElement.querySelector('.task-text');
+          if (textSpan) {
+            const currentText = task.text;
+            const isDark = this.themeMode === 'dark';
+            // 转义 HTML 特殊字符
+            const escapedText = currentText
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;');
+            textSpan.innerHTML = `
+              <div class="flex items-start gap-2 w-full">
+                <textarea id="edit-input-${taskId}"
+                       class="flex-1 min-w-0 px-1.5 py-0.5 border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-700'} rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-xs select-text resize-none overflow-hidden leading-relaxed"
+                       rows="1"
+                       oninput="this.style.height = 'auto'; this.style.height = this.scrollHeight + 'px';"
+                       onkeydown="if(event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); planner.editTask('${taskId}', this.value); } else if(event.key === 'Escape') { planner.updateTaskPanel(); }">${escapedText}</textarea>
+                <div class="flex flex-col gap-1 pt-0.5">
+                  <button onclick="planner.editTask('${taskId}', document.getElementById('edit-input-${taskId}').value)"
+                          class="text-[10px] text-blue-500 hover:text-blue-600 font-medium whitespace-nowrap">
+                    保存
+                  </button>
+                  <button onclick="planner.updateTaskPanel()"
+                          class="text-[10px] text-gray-400 hover:text-gray-500 whitespace-nowrap">
+                    取消
+                  </button>
+                </div>
+              </div>
+            `;
+            const textarea = textSpan.querySelector('textarea');
+            if (textarea) {
+              // 设置初始高度
+              setTimeout(() => {
+                textarea.style.height = 'auto';
+                textarea.style.height = textarea.scrollHeight + 'px';
+                textarea.focus();
+                textarea.select();
+              }, 0);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 选择日期（点击固定显示）
+  private selectDate(date: Date): void {
+    // 清除悬停定时器
+    if (this.hoverTimer !== null) {
+      clearTimeout(this.hoverTimer);
+      this.hoverTimer = null;
+    }
+
+    this.selectedDate = new Date(date);
+    this.hoveredDate = null; // 清除悬停状态，避免混淆
+    this.showTaskPanel = true; // 显示右侧侧边栏
+    this.preselectedTime = ''; // 清空预选时间
+    
+    // 关闭其他面板和弹窗
+    this.showKnowledgeBase = false;
+    this.showStatsModal = false;
+    this.showWeeklySummary = false;
+    this.showMonthlySummary = false;
+    this.showYearlyStats = false;
+    this.showCopyModal = false;
+    this.showThemeMenu = false;
+    this.showQuadrantView = false;
+    this.currentGuide = null;
+    
+    // 快速更新：只更新日历选中状态和任务面板
+    this.updateCalendarSelection();
+    this.updateTaskPanelQuick();
+  }
+
+  // 快速更新任务面板（不重新渲染整个页面）
+  private updateTaskPanelQuick(): void {
+    const displayDate = this.getDisplayDate();
+    if (!displayDate) return;
+
+    const taskPanel = document.querySelector('.task-panel');
+    if (!taskPanel) {
+      // 面板不存在，需要完整渲染
+      this.render();
+      return;
+    }
+
+    // 更新面板位置
+    taskPanel.classList.remove('translate-x-full');
+    taskPanel.classList.add('translate-x-0');
+
+    // 调用现有的更新逻辑
+    this.updateTaskPanel();
+  }
+
+  // 更新日历选中状态
+  private updateCalendarSelection(): void {
+    // 移除之前非今日的选中状态
+    document.querySelectorAll('[data-date]').forEach(el => {
+      const isToday = el.classList.contains('ring-blue-500');
+      if (!isToday) {
+        el.classList.remove('ring-2', 'ring-blue-400');
+      }
+    });
+    
+    // 添加新的选中状态
+    if (this.selectedDate) {
+      const dateKey = this.formatDate(this.selectedDate);
+      const selectedEl = document.querySelector(`[data-date="${dateKey}"]`);
+      if (selectedEl) {
+        const isToday = selectedEl.classList.contains('ring-blue-500');
+        if (!isToday) {
+          selectedEl.classList.add('ring-2', 'ring-blue-400');
+        }
+      }
+    }
+  }
+
+  // 鼠标悬停日期（临时显示）
+  private hoverDate(date: Date): void {
+    // 弹窗打开时，不响应悬停事件
+    if (this.showStatsModal || this.showCopyModal || this.showThemeMenu || 
+        this.showKnowledgeBase || this.showWeeklySummary || this.showMonthlySummary || 
+        this.showYearlyStats || this.showQuadrantView) return;
+
+    // 只有当没有固定选择的日期时，悬停才生效
+    if (!this.selectedDate) {
+      // 清除之前的悬停定时器
+      if (this.hoverTimer !== null) {
+        clearTimeout(this.hoverTimer);
+      }
+
+      // 设置新的悬停定时器，延迟2ms显示面板
+      this.hoverTimer = window.setTimeout(() => {
+        this.hoveredDate = new Date(date);
+        this.updateTaskPanel();
+      }, 2);
+    }
+  }
+
+  // 更新任务面板内容（不重建整个页面）
+  private updateTaskPanel(): void {
+    const displayDate = this.getDisplayDate();
+    if (!displayDate) {
+      // 如果没有显示日期，隐藏面板
+      const taskPanel = document.querySelector('.task-panel');
+      if (taskPanel) {
+        taskPanel.classList.add('translate-x-full');
+        taskPanel.classList.remove('translate-x-0');
+      }
+      return;
+    }
+
+    // 找到任务面板元素
+    const taskPanel = document.querySelector('.task-panel');
+    if (!taskPanel) return;
+
+    taskPanel.classList.remove('translate-x-full');
+    taskPanel.classList.add('translate-x-0');
+
+    // 只更新面板内容，不替换整个面板（避免动画闪烁）
+    const contentWrapper = taskPanel.querySelector('.task-panel-content');
+    if (!contentWrapper) return;
+
+    // 保存当前滚动位置
+    const taskList = contentWrapper.querySelector('.overflow-y-auto');
+    const scrollPosition = taskList ? taskList.scrollTop : 0;
+
+    // 生成新的内容
+    const tasks = this.getSortedTasks(this.getSelectedDateTasks());
+    const dateStr = this.formatDate(displayDate);
+    const lunarText = this.getLunarFullText(displayDate);
+    const holidayInfo = this.getHolidayInfo(displayDate);
+    const isDark = this.themeMode === 'dark';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const taskBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+    const taskHover = isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-100';
+
+    let tasksList = '';
+    tasks.forEach(task => {
+      const taskPriority: TaskPriority = (task.priority || 'normal') as TaskPriority;
+      const priority = getPriorityConfig(taskPriority);
+      const priorityBg = isDark ? priority.darkBg : priority.bgColor;
+      const priorityColor = isDark ? priority.darkColor : priority.color;
+      const borderColor = priority.borderColor;
+      
+      const taskTags = (task.tags || []).map(tagId => {
+        const tag = this.getTagById(tagId);
+        if (tag) {
+          return `<span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs ${tag.color} ${tag.textColor}">${getTagIconSVG(tag.id, tag.icon)} ${tag.name}</span>`;
+        }
+        return '';
+      }).filter(Boolean).join('');
+
+      const tagsDisplay = taskTags ? taskTags : `<button onclick="event.stopPropagation(); planner.showQuickTagSelector('${task.id}')" class="text-xs text-gray-400 hover:text-blue-500 hover:underline cursor-pointer">+ 添加标签</button>`;
+      
+      let guideHTML = '';
+      if (task.guideId) {
+        const guide = this.knowledgeGuides.find(g => g.id === task.guideId);
+        if (guide) {
+          guideHTML = `<div class="mt-1"><button onclick="event.stopPropagation(); planner.openGuideFromTask('${task.guideId}')" class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded ${isDark ? 'bg-purple-900/50 text-purple-300 hover:bg-purple-800/50' : 'bg-purple-100 text-purple-600 hover:bg-purple-200'} transition-colors"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>${guide.name}</button></div>`;
+        }
+      }
+      
+      tasksList += `
+        <div class="p-2 ${taskBg} ${taskHover} rounded-lg group transition-colors border-l-4 ${borderColor} ${task.completed ? 'task-completed' : ''}"
+             draggable="true"
+             ondragstart="planner.onTaskDragStart(event, '${task.id}')"
+             ondblclick="if(!event.target.closest('input') && !event.target.closest('select') && !event.target.closest('button')) planner.startEditTask('${task.id}')"
+             data-task-id="${task.id}">
+          <div class="flex items-center gap-2">
+            <input type="checkbox"
+                   ${task.completed ? 'checked' : ''}
+                   onchange="planner.toggleTask('${task.id}')"
+                   class="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500 cursor-pointer task-checkbox flex-shrink-0">
+            <span class="task-text flex-1 min-w-0 text-sm ${task.completed ? 'line-through text-gray-400' : isDark ? 'text-gray-200' : 'text-gray-700'} select-text whitespace-pre-wrap break-words">${task.text}</span>
+            <div class="flex items-center gap-1 flex-shrink-0 task-actions">
+              <button onclick="planner.startEditTask('${task.id}')"
+                      class="p-1 text-gray-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded transition-colors"
+                      title="编辑">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+              </button>
+              <button onclick="planner.deleteTask('${task.id}')"
+                      class="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors"
+                      title="删除">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 mt-1 ml-6 flex-wrap">
+            <select onchange="planner.updateTaskPriority('${task.id}', this.value)"
+                    class="text-xs px-1.5 py-0.5 rounded ${priorityBg} ${priorityColor} border-0 cursor-pointer">
+              <option value="urgent-important" ${taskPriority === 'urgent-important' ? 'selected' : ''}>紧急</option>
+              <option value="important" ${taskPriority === 'important' ? 'selected' : ''}>重要</option>
+              <option value="urgent" ${taskPriority === 'urgent' ? 'selected' : ''}>急办</option>
+              <option value="normal" ${taskPriority === 'normal' ? 'selected' : ''}>普通</option>
+            </select>
+            ${task.time ? `<span class="text-xs text-gray-400">${task.time}</span>` : ''}
+            ${tagsDisplay}
+          </div>
+          ${guideHTML}
+        </div>
+      `;
+    });
+
+    // 检查是否有纪念日
+    const todayAnniversaries = this.getMatchingAnniversaries(displayDate);
+    
+    let anniversaryHtml = '';
+    if (todayAnniversaries.length > 0) {
+      anniversaryHtml = `
+        <div class="mb-3 p-2 bg-pink-100 dark:bg-pink-900/30 rounded-lg">
+          ${todayAnniversaries.map(a => `
+            <span class="text-pink-600 dark:text-pink-400 text-sm inline-flex items-center gap-1">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+              </svg>
+              ${a.name} (${a.type === 'birthday' ? '生日' : a.type === 'anniversary' ? '纪念日' : '自定义'})
+            </span>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // 更新头部信息
+    const headerSection = contentWrapper.querySelector('.px-4.pb-3.border-b');
+    if (headerSection) {
+      headerSection.innerHTML = `
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-lg font-bold ${textClass}">${dateStr}</h2>
+          <button onclick="planner.closeTaskPanel()"
+                  class="w-6 h-6 flex items-center justify-center bg-gray-200 dark:bg-gray-600 hover:bg-red-500 dark:hover:bg-red-500 rounded-full transition-colors group"
+                  title="关闭面板">
+            <svg class="w-3.5 h-3.5 ${isDark ? 'text-gray-500 group-hover:text-white' : 'text-gray-600 group-hover:text-white'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="${isDark ? 'text-gray-400' : 'text-gray-500'}">农历 ${lunarText}</span>
+          ${holidayInfo ? (holidayInfo.holiday ? 
+            `<span class="px-1.5 py-0.5 bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 rounded">${holidayInfo.name}</span>` : 
+            `<span class="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/50 text-orange-600 dark:text-orange-400 rounded">调休</span>`) : ''}
+        </div>
+      `;
+    }
+
+    // 更新纪念日区域
+    let anniversaryContainer = contentWrapper.querySelector('.anniversary-section');
+    if (todayAnniversaries.length > 0) {
+      if (!anniversaryContainer) {
+        const newDiv = document.createElement('div');
+        newDiv.className = 'anniversary-section px-4';
+        newDiv.innerHTML = anniversaryHtml;
+        const addTaskSection = contentWrapper.querySelector('.px-4.py-3.border-b');
+        if (addTaskSection) {
+          addTaskSection.insertAdjacentElement('afterend', newDiv);
+        }
+      } else {
+        anniversaryContainer.innerHTML = anniversaryHtml;
+      }
+    } else if (anniversaryContainer) {
+      anniversaryContainer.remove();
+    }
+
+    // 更新任务列表
+    const taskListSection = contentWrapper.querySelector('.overflow-y-auto.px-4');
+    if (taskListSection) {
+      taskListSection.innerHTML = tasks.length > 0 ? tasksList : `<p class="text-gray-400 text-center py-8 text-sm">暂无任务</p>`;
+      // 恢复滚动位置
+      taskListSection.scrollTop = scrollPosition;
+    }
+
+    // 更新底部统计
+    const statsSection = contentWrapper.querySelector('.px-4.py-2.border-t');
+    if (statsSection) {
+      statsSection.innerHTML = `共 ${tasks.length} 个任务，已完成 ${tasks.filter(t => t.completed).length} 个`;
+    }
+  }
+
+  // 更新日历指示器颜色
+  private updateCalendarIndicators(): void {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+    const lastDay = new Date(year, month + 1, 0).getDate();
+
+    for (let day = 1; day <= lastDay; day++) {
+      const dateKey = this.formatDate(new Date(year, month, day));
+      const dayTasks = this.tasks[dateKey] || [];
+
+      // 找到对应的日期元素
+      const dateElement = document.querySelector(`[data-date="${dateKey}"]`);
+      if (dateElement) {
+        // 找到或创建指示器元素
+        let indicator = dateElement.querySelector('.task-indicator');
+        if (!indicator && dayTasks.length > 0) {
+          indicator = document.createElement('div');
+          indicator.className = 'task-indicator absolute bottom-1 left-1/2 transform -translate-x-1/2 w-1.5 h-1.5 rounded-full';
+          dateElement.appendChild(indicator);
+        }
+
+        // 更新指示器颜色
+        if (indicator) {
+          if (dayTasks.length === 0) {
+            indicator.remove();
+          } else {
+            const completedTasks = dayTasks.filter(task => task.completed).length;
+            if (completedTasks === dayTasks.length) {
+              indicator.className = 'task-indicator absolute bottom-1 left-1/2 transform -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-green-500';
+            } else {
+              indicator.className = 'task-indicator absolute bottom-1 left-1/2 transform -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-orange-500';
+            }
+          }
+        }
+
+        // 更新日历中任务列表项的完成状态样式
+        const calendarTaskItems = dateElement.querySelectorAll('.calendar-task-item');
+        calendarTaskItems.forEach(item => {
+          const taskId = item.getAttribute('data-task-id');
+          if (taskId) {
+            const task = dayTasks.find(t => t.id === taskId);
+            if (task) {
+              if (task.completed) {
+                item.classList.add('line-through', 'opacity-50');
+              } else {
+                item.classList.remove('line-through', 'opacity-50');
+              }
+            }
+          }
+        });
+      }
+    }
+  }
+
+  // 局部刷新任务相关视图，保留右侧任务面板和输入区状态。
+  private refreshTaskViews(...dateKeys: string[]): void {
+    this.updateTaskPanel();
+
+    [...new Set(dateKeys)].forEach(dateKey => {
+      const dateElement = document.querySelector(`[data-date="${dateKey}"]`);
+      if (!dateElement) return;
+
+      const date = parseLocalDate(dateKey);
+      const dayTasks = [...(this.tasks[dateKey] || [])].sort((a, b) => {
+        if (a.completed !== b.completed) return a.completed ? 1 : -1;
+        const priorityDiff = getPriorityConfig(a.priority).order - getPriorityConfig(b.priority).order;
+        return priorityDiff || (a.time || '').localeCompare(b.time || '');
+      });
+
+      const monthTaskList = dateElement.querySelector('.calendar-task-list');
+      if (monthTaskList) {
+        const visibleTasks = dayTasks.slice(0, 3);
+        const hiddenCount = Math.max(0, dayTasks.length - visibleTasks.length);
+        const isDark = this.themeMode === 'dark';
+
+        monthTaskList.innerHTML = visibleTasks.map(task => {
+          const priority = (task.priority || 'normal') as TaskPriority;
+          const dotColor = priority === 'urgent-important' ? 'bg-red-500' :
+            priority === 'important' ? 'bg-yellow-500' :
+            priority === 'urgent' ? 'bg-orange-500' : 'bg-gray-400';
+
+          return `
+            <div class="text-[11px] truncate calendar-task-item ${task.completed ? 'line-through opacity-50' : ''} ${isDark ? 'text-gray-300' : 'text-gray-700'} flex items-center gap-1 px-1 py-0.5 rounded ${isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'} cursor-pointer"
+                 data-task-id="${task.id}"
+                 onclick="event.stopPropagation(); planner.selectDate(new Date(${date.getFullYear()}, ${date.getMonth()}, ${date.getDate()}))">
+              <span class="w-1.5 h-1.5 ${dotColor} rounded-full flex-shrink-0"></span>
+              <span class="truncate">${this.escapeHtml(task.text)}</span>
+            </div>
+          `;
+        }).join('') + (hiddenCount > 0
+          ? `<div class="text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'} px-1">+${hiddenCount} more</div>`
+          : '');
+      }
+
+      const weekTaskList = dateElement.querySelector('.week-task-list');
+      if (weekTaskList) {
+        const isDark = this.themeMode === 'dark';
+        weekTaskList.innerHTML = dayTasks.length > 0 ? dayTasks.map(task => {
+          const priorityConfig = getPriorityConfig(task.priority);
+          return `
+            <div class="p-2 rounded ${task.completed ? 'bg-gray-100 dark:bg-gray-700' : isDark ? 'bg-gray-700' : 'bg-gray-50'} border-l-2 ${priorityConfig.borderColor}"
+                 onclick="planner.selectDate(new Date(${date.getFullYear()}, ${date.getMonth()}, ${date.getDate()}))">
+              <div class="flex items-center gap-1">
+                <input type="checkbox" ${task.completed ? 'checked' : ''}
+                       onclick="event.stopPropagation(); planner.selectedDate = new Date(${date.getFullYear()}, ${date.getMonth()}, ${date.getDate()}); planner.toggleTask('${task.id}');"
+                       class="w-3 h-3 rounded cursor-pointer">
+                <span class="text-xs ${task.completed ? 'line-through text-gray-400' : isDark ? 'text-gray-100' : 'text-gray-800'} truncate">${this.escapeHtml(task.text)}</span>
+              </div>
+            </div>
+          `;
+        }).join('') : '<p class="text-xs text-gray-400 text-center py-1">无任务</p>';
+      }
+    });
+
+    this.updateCalendarIndicators();
+
+    const weeklyRate = document.getElementById('weekly-summary-rate');
+    if (weeklyRate) weeklyRate.textContent = `${this.getWeeklyStats().percentage}% 完成`;
+  }
+
+  // 鼠标离开日期
+  private leaveDate(): void {
+    // 弹窗打开时，不响应离开事件
+    if (this.showStatsModal || this.showCopyModal || this.showThemeMenu) return;
+
+    // 清除悬停定时器
+    if (this.hoverTimer !== null) {
+      clearTimeout(this.hoverTimer);
+      this.hoverTimer = null;
+    }
+
+    // 只有当没有固定选择的日期时，离开才生效
+    if (!this.selectedDate) {
+      this.hoveredDate = null;
+
+      // 隐藏任务面板
+      const taskPanel = document.querySelector('.task-panel');
+      if (taskPanel) {
+        taskPanel.classList.add('translate-x-full');
+        taskPanel.classList.remove('translate-x-0');
+      }
+    } else {
+      // 如果有选中的日期，确保面板保持显示
+      const taskPanel = document.querySelector('.task-panel');
+      if (taskPanel) {
+        taskPanel.classList.remove('translate-x-full');
+        taskPanel.classList.add('translate-x-0');
+      }
+    }
+  }
+
+  // 关闭任务面板
+  private closeTaskPanel(): void {
+    // 清除悬停定时器
+    if (this.hoverTimer !== null) {
+      clearTimeout(this.hoverTimer);
+      this.hoverTimer = null;
+    }
+    this.selectedDate = null;
+    this.hoveredDate = null;
+    this.showTaskPanel = false;
+    // 重置知识库选择器状态
+    this.selectedGuideId = '';
+    this.guideSearchKeyword = '';
+    this.showGuideDropdown = false;
+    this.selectedTagsForTask.clear();
+    this.render();
+  }
+
+  // 显示/隐藏统计弹窗
+  private toggleStatsModal(): void {
+    this.showStatsModal = !this.showStatsModal;
+
+    // 当打开统计弹窗时，关闭其他弹窗
+    if (this.showStatsModal) {
+      this.showCopyModal = false;
+      this.showThemeMenu = false;
+      this.showQuadrantView = false;
+      // 不关闭任务面板，让弹窗覆盖在上面
+    }
+
+    this.render();
+  }
+
+  // 显示/隐藏四象限视图
+  private toggleQuadrantView(): void {
+    this.showQuadrantView = !this.showQuadrantView;
+
+    // 当打开四象限视图时，关闭其他弹窗
+    if (this.showQuadrantView) {
+      this.showStatsModal = false;
+      this.showCopyModal = false;
+      this.showThemeMenu = false;
+      // 不关闭任务面板，让弹窗覆盖在上面
+      // 初始化日期范围
+      if (!this.quadrantStartDate || !this.quadrantEndDate) {
+        const today = new Date();
+        this.quadrantStartDate = this.formatDate(new Date(today.getFullYear(), today.getMonth(), 1));
+        this.quadrantEndDate = this.formatDate(new Date(today.getFullYear(), today.getMonth() + 1, 0));
+      }
+    }
+
+    this.render();
+  }
+
+  // 设置四象限时间筛选类型
+  private setQuadrantFilter(filter: 'year' | 'month' | 'custom'): void {
+    this.quadrantFilter = filter;
+    const today = new Date();
+    
+    switch (filter) {
+      case 'year':
+        this.quadrantStartDate = this.formatDate(new Date(today.getFullYear(), 0, 1));
+        this.quadrantEndDate = this.formatDate(new Date(today.getFullYear(), 11, 31));
+        break;
+      case 'month':
+        this.quadrantStartDate = this.formatDate(new Date(today.getFullYear(), today.getMonth(), 1));
+        this.quadrantEndDate = this.formatDate(new Date(today.getFullYear(), today.getMonth() + 1, 0));
+        break;
+      // custom 不自动设置日期
+    }
+    
+    this.render();
+  }
+
+  // 设置四象限自定义日期范围
+  private setQuadrantDateRange(startOrEnd: 'start' | 'end', value: string): void {
+    if (startOrEnd === 'start') {
+      this.quadrantStartDate = value;
+    } else {
+      this.quadrantEndDate = value;
+    }
+    this.render();
+  }
+
+  // 获取四象限筛选后的任务
+  private getQuadrantTasks(): { 
+    urgentImportant: Task[];
+    important: Task[];
+    urgent: Task[];
+    normal: Task[];
+  } {
+    const result = {
+      urgentImportant: [] as Task[],
+      important: [] as Task[],
+      urgent: [] as Task[],
+      normal: [] as Task[]
+    };
+
+    if (!this.quadrantStartDate || !this.quadrantEndDate) return result;
+
+    const startDate = new Date(this.quadrantStartDate);
+    const endDate = new Date(this.quadrantEndDate);
+
+    Object.entries(this.tasks).forEach(([dateKey, tasks]) => {
+      const taskDate = parseLocalDate(dateKey);
+      if (taskDate >= startDate && taskDate <= endDate) {
+        tasks.forEach(task => {
+          const priority = task.priority || 'normal';
+          switch (priority) {
+            case 'urgent-important':
+              result.urgentImportant.push({ ...task, date: dateKey });
+              break;
+            case 'important':
+              result.important.push({ ...task, date: dateKey });
+              break;
+            case 'urgent':
+              result.urgent.push({ ...task, date: dateKey });
+              break;
+            case 'normal':
+              result.normal.push({ ...task, date: dateKey });
+              break;
+          }
+        });
+      }
+    });
+
+    // 每个象限内按日期排序
+    const sortByDate = (a: Task, b: Task) => a.date.localeCompare(b.date);
+    result.urgentImportant.sort(sortByDate);
+    result.important.sort(sortByDate);
+    result.urgent.sort(sortByDate);
+    result.normal.sort(sortByDate);
+
+    return result;
+  }
+
+  // 切换月度任务筛选条件
+  private setMonthlyFilter(filter: MonthlyFilter): void {
+    this.monthlyFilter = filter;
+    this.render();
+  }
+
+  // 切换月度任务概览中任务的完成状态
+  private toggleMonthlyTask(date: string, taskId: string): void {
+    if (this.tasks[date]) {
+      const task = this.tasks[date].find(t => t.id === taskId);
+      if (task) {
+        task.completed = !task.completed;
+        this.saveTasks();
+        this.render();
+      }
+    }
+  }
+
+  // 删除月度任务概览中的任务
+  private deleteMonthlyTask(date: string, taskId: string): void {
+    if (this.tasks[date]) {
+      this.tasks[date] = this.tasks[date].filter(task => task.id !== taskId);
+      this.saveTasks();
+      this.render();
+    }
+  }
+
+  // 获取任务指示器颜色
+  private getTaskIndicatorColor(day: number): string {
+    const dateKey = this.formatDate(new Date(this.currentDate.getFullYear(), this.currentDate.getMonth(), day));
+    const dayTasks = this.tasks[dateKey] || [];
+
+    if (dayTasks.length === 0) {
+      return 'hidden';
+    }
+
+    const completedTasks = dayTasks.filter(task => task.completed).length;
+
+    if (completedTasks === dayTasks.length) {
+      return 'bg-green-500';
+    }
+
+    return 'bg-orange-500';
+  }
+
+  // 生成月份选择器HTML
+  private generateMonthPickerHTML(currentYear: number, currentMonth: number, isDark: boolean): string {
+    const monthNames = ['一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月'];
+    const bgClass = isDark ? 'bg-gray-700' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const hoverClass = isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-100';
+    
+    // 使用选择器中选中的年份
+    const pickerYear = this.selectedPickerYear || currentYear;
+    
+    // 生成年份选择
+    const baseYear = pickerYear + this.yearRangeOffset;
+    const years: number[] = [];
+    for (let y = baseYear - 2; y <= baseYear + 2; y++) {
+      years.push(y);
+    }
+    
+    return `
+      <div class="absolute top-full left-1/2 transform -translate-x-1/2 mt-2 ${bgClass} rounded-xl shadow-2xl p-4 z-50 min-w-[280px]"
+           onclick="event.stopPropagation()">
+        <!-- 年份选择 -->
+        <div class="flex items-center justify-between mb-3">
+          <button onclick="planner.yearRangeOffset -= 5; planner.render();"
+                  class="p-1 ${hoverClass} rounded transition-colors">
+            <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+          </button>
+          <div class="flex gap-1">
+            ${years.map(y => `
+              <button onclick="planner.selectPickerYear(${y})"
+                      class="px-2 py-1 text-sm rounded transition-colors ${y === pickerYear 
+                        ? 'bg-blue-500 text-white' 
+                        : (isDark ? 'hover:bg-gray-600 text-gray-300' : 'hover:bg-gray-200 text-gray-700')}">
+                ${y}
+              </button>
+            `).join('')}
+          </div>
+          <button onclick="planner.yearRangeOffset += 5; planner.render();"
+                  class="p-1 ${hoverClass} rounded transition-colors">
+            <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </button>
+        </div>
+        
+        <!-- 月份选择 -->
+        <div class="grid grid-cols-4 gap-2">
+          ${monthNames.map((name, idx) => `
+            <button onclick="planner.selectPickerMonth(${idx})"
+                    class="py-2 px-3 text-sm rounded-lg transition-colors ${idx === currentMonth && pickerYear === currentYear
+                      ? 'bg-blue-500 text-white' 
+                      : (isDark ? 'hover:bg-gray-600 text-gray-300' : 'hover:bg-gray-200 text-gray-700')}">
+              ${name}
+            </button>
+          `).join('')}
+        </div>
+        
+        <!-- 快捷操作 -->
+        <div class="flex gap-2 mt-3 pt-3 border-t ${isDark ? 'border-gray-600' : 'border-gray-200'}">
+          <button onclick="planner.jumpToToday(); planner.showMonthPicker = false; planner.render();"
+                  class="flex-1 py-2 text-sm ${isDark ? 'bg-blue-600 hover:bg-blue-700' : 'bg-blue-500 hover:bg-blue-600'} text-white rounded-lg transition-colors">
+            今天
+          </button>
+          <button onclick="planner.showMonthPicker = false; planner.render();"
+                  class="flex-1 py-2 text-sm ${isDark ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-200 hover:bg-gray-300'} ${textClass} rounded-lg transition-colors">
+            取消
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成日历HTML（任务可视化）
+  private generateCalendarHTML(): string {
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const hoverClass = isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100';
+
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    // 调整：周一为每周第一天，周日为最后一天
+    const startingDay = (firstDay.getDay() + 6) % 7;
+    const totalDays = lastDay.getDate();
+
+    const monthNames = [
+      '一月', '二月', '三月', '四月', '五月', '六月',
+      '七月', '八月', '九月', '十月', '十一月', '十二月'
+    ];
+
+    const isSelectedDate = (d: Date) => {
+      if (!this.selectedDate) return false;
+      return d.getDate() === this.selectedDate.getDate() &&
+             d.getMonth() === this.selectedDate.getMonth() &&
+             d.getFullYear() === this.selectedDate.getFullYear();
+    };
+
+    const isToday = (d: Date) => {
+      const today = new Date();
+      return d.getDate() === today.getDate() &&
+             d.getMonth() === today.getMonth() &&
+             d.getFullYear() === today.getFullYear();
+    };
+
+    // 获取日期的任务列表
+    const getDayTasks = (d: Date): Task[] => {
+      const dateKey = this.formatDate(d);
+      return this.tasks[dateKey] || [];
+    };
+
+    // 生成日期格子的函数
+    const generateDayCell = (d: Date, isCurrentMonth: boolean): string => {
+      const dateKey = this.formatDate(d);
+      const today = isToday(d);
+      const selected = isSelectedDate(d);
+      const dayTasks = getDayTasks(d);
+      const holidayInfo = this.getHolidayInfo(d);
+      
+      // 获取农历信息
+      const lunarText = this.getLunarDisplayText(d);
+      const isJieQi = this.isJieQiDay(d);
+      
+      // 日期数字样式
+      let dayNumClass = isDark ? 'text-gray-200' : 'text-gray-800';
+      let lunarClass = isDark ? 'text-gray-500' : 'text-gray-400';
+      let bgOpacity = '';
+      
+      // 非当前月的日期样式
+      if (!isCurrentMonth) {
+        dayNumClass = isDark ? 'text-gray-500' : 'text-gray-400';
+        lunarClass = isDark ? 'text-gray-600' : 'text-gray-300';
+        bgOpacity = isDark ? 'bg-gray-800/30' : 'bg-gray-50/50';
+      } else if (today) {
+        dayNumClass = 'bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-sm font-bold';
+        lunarClass = 'text-blue-400';
+      } else if (holidayInfo && holidayInfo.holiday) {
+        dayNumClass = 'text-red-500 font-medium';
+        lunarClass = 'text-red-400';
+      } else if (holidayInfo && !holidayInfo.holiday) {
+        dayNumClass = 'text-orange-500';
+        lunarClass = 'text-orange-400';
+      } else {
+        // 默认周末显示红色
+        const dayOfWeek = d.getDay();
+        if (dayOfWeek === 0 || dayOfWeek === 6) {
+          dayNumClass = 'text-red-400';
+          lunarClass = 'text-red-300';
+        }
+      }
+      
+      // 节假日标签
+      let holidayTag = '';
+      if (holidayInfo && isCurrentMonth) {
+        if (holidayInfo.holiday) {
+          holidayTag = `<span class="absolute top-1 right-1 text-[9px] bg-red-500 text-white px-1 rounded">${holidayInfo.name}</span>`;
+        } else {
+          holidayTag = `<span class="absolute top-1 right-1 text-[9px] bg-orange-500 text-white px-1 rounded">班</span>`;
+        }
+      }
+      
+      // 生成任务列表（最多显示3个，多的显示 +X more）
+      // 先对任务排序：未完成的在前，按优先级排序，同优先级按时间排序
+      const sortedDayTasks = [...dayTasks].sort((a, b) => {
+        // 已完成的任务放最后
+        if (a.completed !== b.completed) return a.completed ? 1 : -1;
+        // 未完成任务按优先级排序
+        const pa = getPriorityConfig(a.priority).order;
+        const pb = getPriorityConfig(b.priority).order;
+        if (pa !== pb) return pa - pb;
+        // 同优先级按时间排序
+        return (a.time || '').localeCompare(b.time || '');
+      });
+      
+      let tasksHTML = '';
+      const maxVisible = 3;
+      const visibleTasks = sortedDayTasks.slice(0, maxVisible);
+      const hiddenCount = sortedDayTasks.length - maxVisible;
+      
+      visibleTasks.forEach(task => {
+        const taskPriority = (task.priority || 'normal') as TaskPriority;
+        const dotColor = taskPriority === 'urgent-important' ? 'bg-red-500' :
+                        taskPriority === 'important' ? 'bg-yellow-500' :
+                        taskPriority === 'urgent' ? 'bg-orange-500' : 'bg-gray-400';
+        
+        tasksHTML += `
+          <div class="text-[11px] truncate calendar-task-item ${task.completed ? 'line-through opacity-50' : ''} ${isDark ? 'text-gray-300' : 'text-gray-700'} flex items-center gap-1 px-1 py-0.5 rounded ${isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'} cursor-pointer"
+               data-task-id="${task.id}"
+               onclick="event.stopPropagation(); planner.selectDate(new Date(${d.getFullYear()}, ${d.getMonth()}, ${d.getDate()}))">
+            <span class="w-1.5 h-1.5 ${dotColor} rounded-full flex-shrink-0"></span>
+            <span class="truncate">${task.text}</span>
+          </div>
+        `;
+      });
+      
+      if (hiddenCount > 0) {
+        tasksHTML += `
+          <div class="text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'} px-1">
+            +${hiddenCount} more
+          </div>
+        `;
+      }
+
+      // 计算指示器颜色
+      let indicatorHTML = '';
+      if (dayTasks.length > 0) {
+        const completedTasks = dayTasks.filter(task => task.completed).length;
+        const indicatorColor = completedTasks === dayTasks.length ? 'bg-green-500' : 'bg-orange-500';
+        indicatorHTML = `<div class="task-indicator absolute bottom-1 left-1/2 transform -translate-x-1/2 w-1.5 h-1.5 rounded-full ${indicatorColor}"></div>`;
+      }
+
+      return `
+        <div class="min-h-[100px] ${bgClass} ${bgOpacity} rounded-lg shadow cursor-pointer transition-all hover:shadow-md ${today ? 'ring-2 ring-blue-500' : ''} ${selected ? 'ring-2 ring-blue-400' : ''} relative overflow-hidden"
+             data-date="${dateKey}"
+             onmouseenter="planner.hoverDate(new Date(${d.getFullYear()}, ${d.getMonth()}, ${d.getDate()}))"
+             onmouseleave="planner.leaveDate()"
+             onclick="event.stopPropagation(); planner.selectDate(new Date(${d.getFullYear()}, ${d.getMonth()}, ${d.getDate()}))">
+          <!-- 日期头部 -->
+          <div class="flex items-start justify-between p-1">
+            <div class="flex flex-col">
+              <span class="${today ? dayNumClass : 'text-sm font-medium ' + dayNumClass}">${d.getDate()}</span>
+              <span class="text-[9px] ${lunarClass} ${isJieQi ? 'text-green-400 font-medium' : ''}">${lunarText}</span>
+            </div>
+            ${!today && isCurrentMonth ? holidayTag : ''}
+          </div>
+          <!-- 任务列表 -->
+          <div class="calendar-task-list px-1 pb-1 space-y-0.5">
+            ${tasksHTML}
+          </div>
+          ${indicatorHTML}
+        </div>
+      `;
+    };
+
+    let calendarDays = '';
+
+    // 上个月的日期填充
+    const prevMonth = new Date(year, month, 0); // 上个月最后一天
+    const prevMonthDays = prevMonth.getDate();
+    for (let i = startingDay - 1; i >= 0; i--) {
+      const day = prevMonthDays - i;
+      const date = new Date(year, month - 1, day);
+      calendarDays += generateDayCell(date, false);
+    }
+
+    // 当前月的日期
+    for (let day = 1; day <= totalDays; day++) {
+      const date = new Date(year, month, day);
+      calendarDays += generateDayCell(date, true);
+    }
+
+    // 下个月的日期填充（补齐到42天，6行）
+    const totalCells = startingDay + totalDays;
+    const remainingCells = totalCells % 7 === 0 ? 0 : 7 - (totalCells % 7);
+    for (let day = 1; day <= remainingCells; day++) {
+      const date = new Date(year, month + 1, day);
+      calendarDays += generateDayCell(date, false);
+    }
+
+    return `
+      <div class="${bgClass} rounded-xl shadow-lg p-4 w-full">
+        <div class="flex items-center justify-between mb-4">
+          <button onclick="planner.changeMonth(-1)"
+                  class="p-2 ${hoverClass} rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+          </button>
+          <div class="relative">
+            <h2 class="text-xl font-bold ${textClass} cursor-pointer hover:text-blue-500 transition-colors"
+                onclick="planner.toggleMonthPicker()">
+              ${year}年 ${monthNames[month]}
+            </h2>
+            ${this.showMonthPicker ? this.generateMonthPickerHTML(year, month, isDark) : ''}
+          </div>
+          <button onclick="planner.changeMonth(1)"
+                  class="p-2 ${hoverClass} rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </button>
+        </div>
+        <div class="grid grid-cols-7 gap-1 mb-2">
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2">一</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2">二</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2">三</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2">四</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2">五</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2 text-red-400">六</div>
+          <div class="text-center text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} py-2 text-red-400">日</div>
+        </div>
+        <div class="grid grid-cols-7 gap-1">
+          ${calendarDays}
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成任务面板HTML（右侧侧边栏）
+  private generateTaskPanelHTML(): string {
+    const displayDate = this.getDisplayDate();
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const taskBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+    const taskHover = isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-100';
+    
+    if (!displayDate) {
+      return '';
+    }
+
+    const tasks = this.getSortedTasks(this.getSelectedDateTasks());
+    const dateStr = this.formatDate(displayDate);
+    const lunarText = this.getLunarFullText(displayDate);
+    const holidayInfo = this.getHolidayInfo(displayDate);
+
+    // 排序选项
+    const sortOptions: Record<TaskSortBy, string> = {
+      'priority': '按优先级',
+      'status': '按状态',
+      'time': '按时间',
+      'text': '按名称'
+    };
+    const sortSelect = `
+      <select onchange="planner.setTaskSortBy(this.value)"
+              class="text-xs px-2 py-1 rounded ${isDark ? 'bg-gray-700 text-gray-300 border-gray-600' : 'bg-gray-100 text-gray-600 border-gray-200'} border cursor-pointer">
+        ${Object.entries(sortOptions).map(([value, label]) => 
+          `<option value="${value}" ${this.taskSortBy === value ? 'selected' : ''}>${label}</option>`
+        ).join('')}
+      </select>
+    `;
+
+    // 标签筛选选择器
+    const allTags = this.getAllTags();
+    const tagFilterSelect = `
+      <select onchange="planner.selectedTagFilter = this.value; planner.render();"
+              class="text-xs px-2 py-1 rounded ${isDark ? 'bg-gray-700 text-gray-300 border-gray-600' : 'bg-gray-100 text-gray-600 border-gray-200'} border cursor-pointer">
+        <option value="" ${!this.selectedTagFilter ? 'selected' : ''}>全部标签</option>
+        ${allTags.map(tag => 
+          `<option value="${tag.id}" ${this.selectedTagFilter === tag.id ? 'selected' : ''}>${tag.name}</option>`
+        ).join('')}
+      </select>
+    `;
+
+    let tasksList = '';
+    tasks.forEach(task => {
+      const taskPriority: TaskPriority = (task.priority || 'normal') as TaskPriority;
+      const priority = getPriorityConfig(taskPriority);
+      const priorityBg = isDark ? priority.darkBg : priority.bgColor;
+      const priorityColor = isDark ? priority.darkColor : priority.color;
+      const borderColor = priority.borderColor;
+      
+      // 获取任务的标签显示HTML
+      const taskTags = (task.tags || []).map(tagId => {
+        const tag = this.getTagById(tagId);
+        if (tag) {
+          return `<span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs ${tag.color} ${tag.textColor}">${getTagIconSVG(tag.id, tag.icon)} ${tag.name}</span>`;
+        }
+        return '';
+      }).filter(Boolean).join('');
+
+      // 如果没有标签，显示添加标签按钮
+      const tagsDisplay = taskTags ? taskTags : `<button onclick="event.stopPropagation(); planner.showQuickTagSelector('${task.id}')" class="text-xs text-gray-400 hover:text-blue-500 hover:underline cursor-pointer">+ 添加标签</button>`;
+      
+      // 获取关联知识库显示HTML
+      let guideHTML = '';
+      if (task.guideId) {
+        const guide = this.knowledgeGuides.find(g => g.id === task.guideId);
+        if (guide) {
+          guideHTML = `<div class="mt-1"><button onclick="event.stopPropagation(); planner.openGuideFromTask('${task.guideId}')" class="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded ${isDark ? 'bg-purple-900/50 text-purple-300 hover:bg-purple-800/50' : 'bg-purple-100 text-purple-600 hover:bg-purple-200'} transition-colors"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>${guide.name}</button></div>`;
+        }
+      }
+      
+      tasksList += `
+        <div class="p-2 ${taskBg} ${taskHover} rounded-lg group transition-colors border-l-4 ${borderColor} ${task.completed ? 'task-completed' : ''}"
+             draggable="true"
+             ondragstart="planner.onTaskDragStart(event, '${task.id}')"
+             ondblclick="if(!event.target.closest('input') && !event.target.closest('select') && !event.target.closest('button')) planner.startEditTask('${task.id}')"
+             data-task-id="${task.id}">
+          <div class="flex items-center gap-2">
+            <input type="checkbox"
+                   ${task.completed ? 'checked' : ''}
+                   onchange="planner.toggleTask('${task.id}')"
+                   class="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500 cursor-pointer task-checkbox flex-shrink-0">
+            <span class="task-text flex-1 min-w-0 text-sm ${task.completed ? 'line-through text-gray-400' : isDark ? 'text-gray-200' : 'text-gray-700'} select-text whitespace-pre-wrap break-words">${task.text}</span>
+            <div class="flex items-center gap-1 flex-shrink-0 task-actions">
+              <button onclick="planner.startEditTask('${task.id}')"
+                      class="p-1 text-gray-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded transition-colors"
+                      title="编辑">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+              </button>
+              <button onclick="planner.deleteTask('${task.id}')"
+                      class="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors"
+                      title="删除">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 mt-1 ml-6 flex-wrap">
+            <select onchange="planner.updateTaskPriority('${task.id}', this.value)"
+                    class="text-xs px-1.5 py-0.5 rounded ${priorityBg} ${priorityColor} border-0 cursor-pointer">
+              <option value="urgent-important" ${taskPriority === 'urgent-important' ? 'selected' : ''}>紧急</option>
+              <option value="important" ${taskPriority === 'important' ? 'selected' : ''}>重要</option>
+              <option value="urgent" ${taskPriority === 'urgent' ? 'selected' : ''}>急办</option>
+              <option value="normal" ${taskPriority === 'normal' ? 'selected' : ''}>普通</option>
+            </select>
+            ${task.time ? `<span class="text-xs text-gray-400">${task.time}</span>` : ''}
+            ${tagsDisplay}
+          </div>
+          ${guideHTML}
+        </div>
+      `;
+    });
+
+    // 检查是否有纪念日
+    const todayAnniversaries = this.getMatchingAnniversaries(displayDate);
+    
+    let anniversaryHtml = '';
+    if (todayAnniversaries.length > 0) {
+      anniversaryHtml = `
+        <div class="mb-2 p-2 bg-pink-100 dark:bg-pink-900/30 rounded-lg">
+          ${todayAnniversaries.map(a => `
+            <span class="text-pink-600 dark:text-pink-400 text-xs inline-flex items-center gap-1">
+              <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+              </svg>
+              ${a.name}
+            </span>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    return `
+      <!-- 右侧侧边栏任务面板 -->
+      <div class="task-panel fixed top-0 right-0 h-full w-80 ${bgClass} shadow-2xl z-40 transform transition-transform duration-300 ${this.showTaskPanel ? 'translate-x-0' : 'translate-x-full'}">
+        <div class="task-panel-content h-full flex flex-col ${window.electronAPI ? 'pt-10' : 'pt-4'}">
+          <!-- 头部 -->
+          <div class="px-4 pb-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}">
+            <div class="flex items-center justify-between mb-2">
+              <h2 class="text-lg font-bold ${textClass}">${dateStr}</h2>
+              <button onclick="planner.closeTaskPanel()"
+                      class="w-6 h-6 flex items-center justify-center bg-gray-200 dark:bg-gray-600 hover:bg-red-500 dark:hover:bg-red-500 rounded-full transition-colors group"
+                      title="关闭面板">
+                <svg class="w-3.5 h-3.5 ${isDark ? 'text-gray-500 group-hover:text-white' : 'text-gray-600 group-hover:text-white'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+            <div class="flex items-center gap-2 text-xs">
+              <span class="${isDark ? 'text-gray-400' : 'text-gray-500'}">农历 ${lunarText}</span>
+              ${holidayInfo ? (holidayInfo.holiday ? 
+                `<span class="px-1.5 py-0.5 bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 rounded">${holidayInfo.name}</span>` : 
+                `<span class="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/50 text-orange-600 dark:text-orange-400 rounded">调休</span>`) : ''}
+              <div class="flex-1"></div>
+              ${sortSelect}
+              ${tagFilterSelect}
+            </div>
+          </div>
+          
+          ${anniversaryHtml}
+          
+          <!-- 添加任务区域 -->
+          <div class="px-4 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}">
+            <textarea id="taskInput"
+                      placeholder="添加新任务...&#10;支持多行输入&#10;按 Ctrl+Enter 添加"
+                      rows="3"
+                      class="w-full px-3 py-2 border ${inputBg} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent ${isDark ? 'text-gray-100 placeholder-gray-400' : 'text-gray-800 placeholder-gray-400'} text-sm resize-none"
+                      onkeydown="if(event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); planner.handleAddTask(); }"></textarea>
+            <div class="flex items-center gap-2 mt-2">
+              <select id="taskTimeInput" class="flex-1 px-2 py-1.5 text-xs border ${inputBg} rounded-lg ${isDark ? 'text-gray-100' : ''}">
+                <option value="">不设置时间</option>
+                ${Array.from({length: 24}, (_, h) => 
+                  Array.from({length: 4}, (_, m) => {
+                    const hour = h.toString().padStart(2, '0');
+                    const min = (m * 15).toString().padStart(2, '0');
+                    const selected = this.preselectedTime === `${hour}:${min}`;
+                    return `<option value="${hour}:${min}" ${selected ? 'selected' : ''}>${hour}:${min}</option>`;
+                  }).join('')
+                ).join('')}
+              </select>
+              <select id="prioritySelect" class="flex-1 px-2 py-1.5 text-xs border ${inputBg} rounded-lg ${isDark ? 'text-gray-100' : ''}">
+                <option value="urgent-important">紧急重要</option>
+                <option value="important">重要不急</option>
+                <option value="urgent">紧急不重要</option>
+                <option value="normal" selected>普通</option>
+              </select>
+              <button onclick="planner.handleAddTask()"
+                      class="px-4 py-1.5 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 transition-colors">
+                添加
+              </button>
+            </div>
+            <!-- 标签选择器 -->
+            <div class="flex flex-wrap gap-1 mt-2 items-center">
+              <span class="text-[10px] ${isDark ? 'text-gray-400' : 'text-gray-500'}">标签：</span>
+              ${this.getAllTags().slice(0, 6).map(tag => `
+                <button type="button"
+                        data-tag-id="${tag.id}"
+                        title="${tag.name}"
+                        onclick="event.stopPropagation(); planner.toggleTagSelection('${tag.id}')"
+                        class="text-[10px] px-1.5 py-0.5 rounded-full transition-all ${tag.color} ${tag.textColor} hover:opacity-80 flex items-center gap-0.5 ${this.selectedTagsForTask.has(tag.id) ? 'ring-2 ring-blue-500 ring-offset-1' : ''}">
+                  ${getTagIconSVG(tag.id, tag.icon)}<span class="tag-check-mark">${this.selectedTagsForTask.has(tag.id) ? ' ✓' : ''}</span>
+                </button>
+              `).join('')}
+              ${this.getAllTags().length > 6 ? `
+                <button onclick="planner.toggleTagManager()"
+                        class="text-[10px] px-1.5 py-0.5 rounded-full ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600'}">
+                  +${this.getAllTags().length - 6}
+                </button>
+              ` : ''}
+            </div>
+            <!-- 知识库选择器（可搜索下拉） -->
+            <div class="flex items-center gap-2 mt-2 relative" id="guideSelectorWrapper">
+              <span class="text-[10px] ${isDark ? 'text-gray-400' : 'text-gray-500'}">知识库：</span>
+              <div class="flex-1 relative">
+                <input type="text"
+                       id="guideSearchInput"
+                       placeholder="搜索知识库..."
+                       value="${this.guideSearchKeyword}"
+                       oninput="event.stopPropagation(); planner.onGuideSearchInput(this.value)"
+                       onfocus="event.stopPropagation(); planner.onGuideSearchFocus()"
+                       onclick="event.stopPropagation()"
+                       onkeydown="event.stopPropagation()"
+                       onkeyup="event.stopPropagation()"
+                       onblur="setTimeout(() => planner.closeGuideDropdown(), 200)"
+                       class="w-full px-2 py-1 text-xs border ${inputBg} rounded-lg ${isDark ? 'text-gray-100 placeholder-gray-400' : 'text-gray-800 placeholder-gray-400'} pr-7"
+                />
+                <!-- 清除按钮（始终存在DOM中，通过style控制显示） -->
+                <button id="guideClearBtn"
+                        onclick="event.stopPropagation(); planner.clearSelectedGuide()"
+                        style="display: ${this.selectedGuideId ? 'block' : 'none'}"
+                        class="absolute right-2 top-1/2 -translate-y-1/2 ${isDark ? 'text-gray-400 hover:text-gray-200' : 'text-gray-400 hover:text-gray-600'}">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+                <!-- 下拉列表（始终存在DOM中，通过style控制显示） -->
+                <div id="guideDropdown" 
+                     style="display: ${this.showGuideDropdown ? 'block' : 'none'}"
+                     class="absolute left-0 right-0 top-full mt-1 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} border rounded-lg shadow-lg max-h-48 overflow-y-auto z-50">
+                  ${this.generateGuideDropdownItems(isDark)}
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 任务列表 -->
+          <div class="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+            ${tasks.length > 0 ? tasksList : `<p class="text-gray-400 text-center py-8 text-sm">暂无任务</p>`}
+          </div>
+          
+          <!-- 底部统计 -->
+          <div class="px-4 py-2 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'} text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">
+            共 ${tasks.length} 个任务，已完成 ${tasks.filter(t => t.completed).length} 个
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成更新弹窗 HTML
+  private generateUpdateModalHTML(): string {
+    if (!this.showUpdateModal) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.closeUpdateModal()">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-md"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-bold ${textClass}">🔄 软件更新</h2>
+            <button onclick="planner.closeUpdateModal()"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="space-y-4">
+            ${this.checkingForUpdate ? `
+              <div class="text-center py-8">
+                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                <p class="${textClass}">正在检查更新...</p>
+              </div>
+            ` : this.updateDownloaded ? `
+              <div class="text-center py-4">
+                <div class="text-6xl mb-4">✅</div>
+                <h3 class="text-lg font-semibold ${textClass} mb-2">更新已准备就绪</h3>
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-600'} mb-4">
+                  版本 ${this.updateInfo?.version || '新版本'} 已下载完成
+                </p>
+                <button onclick="planner.installUpdate()"
+                        class="w-full py-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium">
+                  立即重启并安装
+                </button>
+                <button onclick="planner.closeUpdateModal()"
+                        class="w-full py-2 mt-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} ${textClass} rounded-lg transition-colors">
+                  稍后提醒
+                </button>
+              </div>
+            ` : this.downloadProgress ? `
+              <div class="text-center py-4">
+                <h3 class="text-lg font-semibold ${textClass} mb-4">正在下载更新...</h3>
+                <div class="w-full bg-gray-200 rounded-full h-4 mb-2 ${isDark ? 'bg-gray-700' : ''}">
+                  <div class="bg-blue-500 h-4 rounded-full transition-all" style="width: ${this.downloadProgress.percent}%"></div>
+                </div>
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-600'}">${this.downloadProgress.percent.toFixed(1)}%</p>
+              </div>
+            ` : this.updateAvailable && this.updateInfo ? `
+              <div class="text-center py-4">
+                <div class="w-16 h-16 mx-auto mb-4 bg-green-100 dark:bg-green-900/50 rounded-full flex items-center justify-center">
+                  <svg class="w-8 h-8 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"/>
+                  </svg>
+                </div>
+                <h3 class="text-lg font-semibold ${textClass} mb-2">发现新版本</h3>
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-600'} mb-1">
+                  最新版本: <span class="font-medium ${textClass}">${this.updateInfo.version}</span>
+                </p>
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-600'} mb-4 text-sm">
+                  发布日期: ${this.updateInfo.releaseDate ? new Date(this.updateInfo.releaseDate).toLocaleDateString('zh-CN') : '未知'}
+                </p>
+                ${this.updateInfo.releaseNotes ? `
+                  <div class="${cardBg} rounded-lg p-3 mb-4 text-left max-h-32 overflow-y-auto">
+                    <p class="text-sm ${textClass}">${this.updateInfo.releaseNotes}</p>
+                  </div>
+                ` : ''}
+                <button onclick="planner.downloadUpdate()"
+                        class="w-full py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium">
+                  立即下载
+                </button>
+                <button onclick="planner.closeUpdateModal()"
+                        class="w-full py-2 mt-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} ${textClass} rounded-lg transition-colors">
+                  稍后更新
+                </button>
+              </div>
+            ` : `
+              <div class="text-center py-4">
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-600'}">检查更新中...</p>
+              </div>
+            `}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成快捷键帮助弹窗
+  private generateShortcutHelpHTML(): string {
+    if (!this.showShortcutHelp) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const keyBg = isDark ? 'bg-gray-700 text-gray-200' : 'bg-gray-100 text-gray-700';
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showShortcutHelp = false; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-md"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-bold ${textClass}">⌨️ 快捷键</h2>
+            <button onclick="planner.showShortcutHelp = false; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="space-y-3">
+            <div class="text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} uppercase tracking-wide">应用内快捷键</div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">搜索任务</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">/</kbd>
+            </div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">添加任务</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">Ctrl + Enter</kbd>
+            </div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">关闭弹窗</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">Esc</kbd>
+            </div>
+
+            <div class="border-t ${isDark ? 'border-gray-700' : 'border-gray-200'} my-3"></div>
+            <div class="text-sm font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} uppercase tracking-wide">全局快捷键</div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">显示/隐藏窗口</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">Ctrl + Shift + P</kbd>
+            </div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">快速添加任务</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">Ctrl + Shift + N</kbd>
+            </div>
+            
+            <div class="flex items-center justify-between py-2">
+              <span class="${textClass}">跳转到今天</span>
+              <kbd class="px-2 py-1 rounded ${keyBg} text-sm font-mono">Ctrl + Shift + T</kbd>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成联系作者弹窗
+  private generateContactInfoHTML(): string {
+    if (!this.showContactInfo) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const labelClass = isDark ? 'text-gray-400' : 'text-gray-500';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showContactInfo = false; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-lg"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-bold ${textClass}">👤 联系作者</h2>
+            <button onclick="planner.showContactInfo = false; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <!-- 开发者 -->
+            <div class="text-center p-4 ${cardBg} rounded-lg">
+              <div class="w-16 h-16 mx-auto mb-3 rounded-full bg-gradient-to-br from-blue-400 to-purple-500 flex items-center justify-center">
+                <span class="text-2xl">👨‍💻</span>
+              </div>
+              <h3 class="text-base font-semibold ${textClass}">严辉村高斯林</h3>
+              <p class="text-xs ${labelClass} mb-3">每日规划 作者</p>
+              
+              <div class="space-y-3 text-left">
+                <div class="flex items-center gap-2 p-2 ${isDark ? 'bg-gray-600' : 'bg-gray-100'} rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
+                     onclick="window.open('https://github.com/tuweihuasheng/daily-planner/issues')">
+                  <div class="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center flex-shrink-0">
+                    <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/>
+                    </svg>
+                  </div>
+                  <div class="flex-1">
+                    <p class="text-[10px] ${labelClass}">反馈 / 建议</p>
+                    <p class="text-xs font-medium ${textClass}">GitHub Issues</p>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2 p-2 ${isDark ? 'bg-gray-600' : 'bg-gray-100'} rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
+                     onclick="window.open('https://github.com/tuweihuasheng/daily-planner')">
+                  <div class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+                    <svg class="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/>
+                    </svg>
+                  </div>
+                  <div class="flex-1">
+                    <p class="text-[10px] ${labelClass}">开源仓库</p>
+                    <p class="text-xs font-medium ${textClass}">GitHub</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 产品经理 -->
+            <div class="text-center p-4 ${cardBg} rounded-lg flex flex-col items-center justify-center">
+              <div class="w-16 h-16 mb-3 rounded-full bg-gradient-to-br from-orange-400 to-pink-500 flex items-center justify-center">
+                <span class="text-2xl">🥜</span>
+              </div>
+              <h3 class="text-base font-semibold ${textClass}">土味花生</h3>
+              <p class="text-xs ${labelClass} mb-2">每日规划 产品经理</p>
+              <div class="flex items-center gap-2 p-2 ${isDark ? 'bg-gray-600' : 'bg-gray-100'} rounded-lg">
+                <div class="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+                  <svg class="w-3 h-3 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                  </svg>
+                </div>
+                <p class="text-[10px] ${textClass}">产品策划 · 团队协作</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="pt-4 text-center">
+            <p class="text-xs ${labelClass}">感谢使用每日规划！欢迎反馈建议 🙏</p>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成循环日程管理弹窗HTML
+  private generateRecurringScheduleModalHTML(): string {
+    if (!this.showRecurringScheduleModal) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const labelClass = isDark ? 'text-gray-400' : 'text-gray-500';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+    const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
+
+    // 如果正在编辑，显示编辑表单
+    if (this.editingRecurringSchedule) {
+      const schedule = this.editingRecurringSchedule;
+      const isWeekly = schedule.recurrenceType === 'weekly';
+      
+      return `
+        <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+             onclick="planner.cancelEditRecurringSchedule();">
+          <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-md"
+               onclick="event.stopPropagation()">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="text-xl font-bold ${textClass}">${schedule.id ? '编辑' : '创建'}循环日程</h2>
+              <button onclick="planner.cancelEditRecurringSchedule();"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+
+            <!-- 日程名称 -->
+            <div class="mb-4">
+              <label class="block text-sm ${labelClass} mb-1">日程名称</label>
+              <input type="text" value="${schedule.name}"
+                     onchange="planner.updateEditingRecurringSchedule('name', this.value)"
+                     class="w-full px-3 py-2 ${inputBg} border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${textClass}"
+                     placeholder="输入日程名称">
+            </div>
+
+            <!-- 提醒时间 -->
+            <div class="mb-4">
+              <label class="block text-sm ${labelClass} mb-1">提醒时间（可选）</label>
+              <input type="time" value="${schedule.time || ''}"
+                     onchange="planner.updateEditingRecurringSchedule('time', this.value)"
+                     class="w-full px-3 py-2 ${inputBg} border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${textClass}">
+            </div>
+
+            <!-- 循环类型 -->
+            <div class="mb-4">
+              <label class="block text-sm ${labelClass} mb-2">循环类型</label>
+              <div class="flex gap-2">
+                <button onclick="planner.updateEditingRecurringSchedule('recurrenceType', 'weekly')"
+                        class="flex-1 py-2 px-4 rounded-lg transition-all ${isWeekly ? 'bg-blue-500 text-white' : `${cardBg} ${textClass}`}">
+                  按周循环
+                </button>
+                <button onclick="planner.updateEditingRecurringSchedule('recurrenceType', 'monthly')"
+                        class="flex-1 py-2 px-4 rounded-lg transition-all ${!isWeekly ? 'bg-blue-500 text-white' : `${cardBg} ${textClass}`}">
+                  按月循环
+                </button>
+              </div>
+            </div>
+
+            ${isWeekly ? `
+              <!-- 按周循环：选择星期几 -->
+              <div class="mb-4">
+                <label class="block text-sm ${labelClass} mb-2">选择星期几</label>
+                <div class="flex gap-2">
+                  ${weekDays.map((day, index) => {
+                    const isSelected = schedule.weekdays?.includes(index);
+                    return `
+                      <button onclick="planner.toggleWeekday(${index})"
+                              class="w-10 h-10 rounded-lg transition-all flex items-center justify-center font-medium
+                                     ${isSelected ? 'bg-blue-500 text-white' : `${cardBg} ${textClass}`}">
+                        ${day}
+                      </button>
+                    `;
+                  }).join('')}
+                </div>
+              </div>
+            ` : `
+              <!-- 按月循环：选择日期 -->
+              <div class="mb-4">
+                <label class="block text-sm ${labelClass} mb-2">每月几号</label>
+                <select onchange="planner.updateEditingRecurringSchedule('monthDay', parseInt(this.value))"
+                        class="w-full px-3 py-2 ${inputBg} border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${textClass}">
+                  ${Array.from({length: 31}, (_, i) => i + 1).map(day => `
+                    <option value="${day}" ${schedule.monthDay === day ? 'selected' : ''}>每月 ${day} 号</option>
+                  `).join('')}
+                </select>
+              </div>
+            `}
+
+            <!-- 开始日期 -->
+            <div class="mb-6">
+              <label class="block text-sm ${labelClass} mb-1">开始日期</label>
+              <input type="date" value="${schedule.startDate}"
+                     onchange="planner.updateEditingRecurringSchedule('startDate', this.value)"
+                     class="w-full px-3 py-2 ${inputBg} border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${textClass}">
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="flex gap-3">
+              <button onclick="planner.cancelEditRecurringSchedule();"
+                      class="flex-1 py-2 px-4 ${cardBg} ${textClass} rounded-lg transition-colors hover:opacity-80">
+                取消
+              </button>
+              <button onclick="planner.saveRecurringSchedule();"
+                      class="flex-1 py-2 px-4 bg-blue-500 text-white rounded-lg transition-colors hover:bg-blue-600">
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // 显示列表
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.closeRecurringScheduleModal();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-lg"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-bold ${textClass}">🔄 循环日程管理</h2>
+            <button onclick="planner.closeRecurringScheduleModal();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <!-- 创建按钮 -->
+          <button onclick="planner.openEditRecurringSchedule();"
+                  class="w-full mb-4 py-3 border-2 border-dashed ${isDark ? 'border-gray-600 hover:border-blue-400' : 'border-gray-300 hover:border-blue-400'} rounded-xl transition-colors flex items-center justify-center gap-2 ${labelClass} hover:text-blue-500">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+            </svg>
+            创建循环日程
+          </button>
+
+          <!-- 日程列表 -->
+          ${this.recurringSchedules.length === 0 ? `
+            <div class="text-center py-8 ${labelClass}">
+              <svg class="w-16 h-16 mx-auto mb-3 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+              </svg>
+              <p>暂无循环日程</p>
+              <p class="text-xs mt-1">点击上方按钮创建</p>
+            </div>
+          ` : `
+            <div class="space-y-2 max-h-[60vh] overflow-y-auto">
+              ${this.recurringSchedules.map(schedule => {
+                const typeLabel = schedule.recurrenceType === 'weekly' 
+                  ? `每${schedule.weekdays?.map((d: number) => '周' + weekDays[d]).join('、')}` 
+                  : `每月${schedule.monthDay}号`;
+                return `
+                  <div class="p-3 ${cardBg} rounded-lg flex items-center justify-between group">
+                    <div class="flex-1 min-w-0">
+                      <div class="font-medium ${textClass} truncate">${schedule.name}</div>
+                      <div class="text-xs ${labelClass} mt-0.5">
+                        ${typeLabel}
+                        ${schedule.time ? ` · ${schedule.time}` : ''}
+                      </div>
+                    </div>
+                    <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button onclick="planner.openEditRecurringSchedule('${schedule.id}');"
+                              class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+                              title="编辑">
+                        <svg class="w-4 h-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                        </svg>
+                      </button>
+                      <button onclick="planner.deleteRecurringSchedule('${schedule.id}');"
+                              class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors"
+                              title="删除">
+                        <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  private generateMemoListHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const labelClass = isDark ? 'text-gray-400' : 'text-gray-500';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+    const filteredMemos = this.getFilteredMemos();
+    const hasKeyword = this.memoSearchKeyword.trim().length > 0;
+
+    if (this.memos.length === 0 && this.editingMemoIndex !== -2) {
+      return `
+        <div class="text-center py-6 ${labelClass}">
+          <svg class="w-10 h-10 mx-auto mb-2 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <p class="text-sm">暂无备忘录</p>
+          <button onclick="planner.addMemo();"
+                  class="mt-2 px-3 py-1 text-xs bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors">
+            添加备忘
+          </button>
+        </div>
+      `;
+    }
+
+    const memoItems = filteredMemos.map(({ memo, index }) => `
+      ${this.editingMemoIndex === index ? `
+        <div class="p-2 ${cardBg} rounded-lg mb-2">
+          <textarea id="memo-edit-${index}"
+                    class="w-full px-2 py-1.5 text-sm ${inputBg} border rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-500 ${textClass} resize-none"
+                    rows="3"
+                    placeholder="输入备忘内容...">${this.escapeHtml(memo)}</textarea>
+          <div class="flex justify-end gap-2 mt-2">
+            <button onclick="event.stopPropagation(); planner.cancelMemoEdit();"
+                    class="px-2 py-1 text-xs ${cardBg} ${textClass} rounded hover:opacity-80">取消</button>
+            <button onclick="event.stopPropagation(); planner.saveMemoContent(document.getElementById('memo-edit-${index}').value);"
+                    class="px-2 py-1 text-xs bg-amber-500 text-white rounded hover:bg-amber-600">保存</button>
+          </div>
+        </div>
+      ` : `
+        <div class="group p-2 ${cardBg} rounded-lg mb-2 relative">
+          <p class="text-sm ${textClass} whitespace-pre-wrap break-words pr-10">${this.highlightMemoKeyword(memo)}</p>
+          <div class="absolute top-2 right-2 flex gap-1">
+            <button onclick="event.stopPropagation(); planner.editMemo(${index});"
+                    class="p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+                    title="编辑">
+              <svg class="w-3.5 h-3.5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+              </svg>
+            </button>
+            <button onclick="event.stopPropagation(); planner.deleteMemo(${index});"
+                    class="p-1 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors"
+                    title="删除">
+              <svg class="w-3.5 h-3.5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      `}
+    `).join('');
+
+    const noResults = hasKeyword && filteredMemos.length === 0 ? `
+      <div class="text-center py-7 ${labelClass}">
+        <svg class="w-9 h-9 mx-auto mb-2 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <p class="text-sm">没有找到匹配的备忘录</p>
+      </div>
+    ` : '';
+
+    const newMemoEditor = this.editingMemoIndex === -2 ? `
+      <div class="p-2 ${cardBg} rounded-lg">
+        <textarea id="memo-new"
+                  class="w-full px-2 py-1.5 text-sm ${inputBg} border rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-500 ${textClass} resize-none"
+                  rows="3"
+                  placeholder="输入备忘内容..."></textarea>
+        <div class="flex justify-end gap-2 mt-2">
+          <button onclick="event.stopPropagation(); planner.cancelMemoEdit();"
+                  class="px-2 py-1 text-xs ${cardBg} ${textClass} rounded hover:opacity-80">取消</button>
+          <button onclick="event.stopPropagation(); planner.saveMemoContent(document.getElementById('memo-new').value);"
+                  class="px-2 py-1 text-xs bg-amber-500 text-white rounded hover:bg-amber-600">保存</button>
+        </div>
+      </div>
+    ` : '';
+
+    return `${noResults}${memoItems}${newMemoEditor}`;
+  }
+
+  // 生成备忘录面板HTML
+  private generateMemoPanelHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const labelClass = isDark ? 'text-gray-400' : 'text-gray-500';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+    
+    // 入口按钮（左上角）
+    const entryButton = `
+      <div class="fixed left-4 top-16 z-30 memo-panel-container"
+           onmouseenter="planner.openMemoPanelHover();"
+           onmouseleave="planner.checkCloseMemoPanel(event);">
+        <!-- 备忘录入口按钮 -->
+        <button onclick="planner.toggleMemoPanel();"
+                class="w-12 h-12 ${this.memos.length > 0 ? 'bg-amber-500' : 'bg-gray-400'} text-white rounded-full shadow-lg hover:shadow-xl transition-all flex items-center justify-center relative"
+                title="备忘录">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          ${this.memos.length > 0 ? `
+            <span class="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-xs rounded-full flex items-center justify-center font-medium">
+              ${this.memos.length}
+            </span>
+          ` : ''}
+        </button>
+        
+        <!-- 悬停面板 -->
+        ${this.showMemoPanel ? `
+          <div class="absolute left-0 top-12 w-72 ${bgClass} rounded-xl shadow-2xl border ${isDark ? 'border-gray-700' : 'border-gray-200'} overflow-hidden pb-2"
+               onmouseenter="planner.keepMemoPanelOpen();">
+            <!-- 标题栏 -->
+            <div class="px-4 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'} flex items-center justify-between">
+              <h3 class="font-semibold ${textClass} flex items-center gap-2">
+                <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                备忘录
+              </h3>
+              <div class="flex items-center gap-1">
+                <button onclick="planner.addMemo();"
+                        class="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition-colors"
+                        title="添加备忘">
+                  <svg class="w-4 h-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                  </svg>
+                </button>
+                <button onclick="planner.closeMemoPanel();"
+                        class="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition-colors"
+                        title="关闭">
+                  <svg class="w-4 h-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 搜索框 -->
+            <div class="px-3 py-2 border-b ${isDark ? 'border-gray-700' : 'border-gray-100'}">
+              <div class="relative">
+                <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 ${labelClass}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                </svg>
+                <input id="memo-search-input" type="search"
+                       value="${this.escapeHtml(this.memoSearchKeyword)}"
+                       oninput="planner.searchMemos(this.value)"
+                       ${this.editingMemoIndex !== -1 ? 'disabled' : ''}
+                       placeholder="搜索备忘内容..."
+                       class="w-full h-9 pl-8 pr-8 text-sm ${inputBg} ${textClass} border rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50">
+                <button id="memo-search-clear" onclick="planner.clearMemoSearch();"
+                        class="${this.memoSearchKeyword.trim() ? '' : 'hidden'} absolute right-1.5 top-1/2 -translate-y-1/2 p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+                        title="清空搜索">
+                  <svg class="w-3.5 h-3.5 ${labelClass}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 备忘录列表 -->
+            <div id="memo-list" class="max-h-64 overflow-y-auto p-2">
+              ${this.memos.length === 0 && this.editingMemoIndex !== -2 ? `
+                <div class="text-center py-6 ${labelClass}">
+                  <svg class="w-10 h-10 mx-auto mb-2 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                  </svg>
+                  <p class="text-sm">暂无备忘录</p>
+                  <button onclick="planner.addMemo();"
+                          class="mt-2 px-3 py-1 text-xs bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors">
+                    添加备忘
+                  </button>
+                </div>
+              ` : `
+                ${this.memoSearchKeyword.trim() && this.getFilteredMemos().length === 0 ? `
+                  <div class="text-center py-7 ${labelClass}">
+                    <svg class="w-9 h-9 mx-auto mb-2 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                    </svg>
+                    <p class="text-sm">没有找到匹配的备忘录</p>
+                  </div>
+                ` : ''}
+                ${this.getFilteredMemos().map(({ memo, index }) => `
+                  ${this.editingMemoIndex === index ? `
+                    <!-- 编辑模式 -->
+                    <div class="p-2 ${cardBg} rounded-lg mb-2">
+                      <textarea id="memo-edit-${index}"
+                                class="w-full px-2 py-1.5 text-sm ${inputBg} border rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-500 ${textClass} resize-none"
+                                rows="3"
+                                placeholder="输入备忘内容...">${this.escapeHtml(memo)}</textarea>
+                      <div class="flex justify-end gap-2 mt-2">
+                        <button onclick="event.stopPropagation(); planner.cancelMemoEdit();"
+                                class="px-2 py-1 text-xs ${cardBg} ${textClass} rounded hover:opacity-80">
+                          取消
+                        </button>
+                        <button onclick="event.stopPropagation(); planner.saveMemoContent(document.getElementById('memo-edit-${index}').value);"
+                                class="px-2 py-1 text-xs bg-amber-500 text-white rounded hover:bg-amber-600">
+                          保存
+                        </button>
+                      </div>
+                    </div>
+                  ` : `
+                    <!-- 显示模式 -->
+                    <div class="group p-2 ${cardBg} rounded-lg mb-2 relative">
+                      <p class="text-sm ${textClass} whitespace-pre-wrap break-words pr-10">${this.highlightMemoKeyword(memo)}</p>
+                      <div class="absolute top-2 right-2 flex gap-1">
+                        <button onclick="event.stopPropagation(); planner.editMemo(${index});"
+                                class="p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+                                title="编辑">
+                          <svg class="w-3.5 h-3.5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                          </svg>
+                        </button>
+                        <button onclick="event.stopPropagation(); planner.deleteMemo(${index});"
+                                class="p-1 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors"
+                                title="删除">
+                          <svg class="w-3.5 h-3.5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  `}
+                `).join('')}
+                
+                ${this.editingMemoIndex === -2 ? `
+                  <!-- 新增模式 -->
+                  <div class="p-2 ${cardBg} rounded-lg">
+                    <textarea id="memo-new"
+                              class="w-full px-2 py-1.5 text-sm ${inputBg} border rounded-lg focus:outline-none focus:ring-1 focus:ring-amber-500 ${textClass} resize-none"
+                              rows="3"
+                              placeholder="输入备忘内容..."></textarea>
+                    <div class="flex justify-end gap-2 mt-2">
+                      <button onclick="event.stopPropagation(); planner.cancelMemoEdit();"
+                              class="px-2 py-1 text-xs ${cardBg} ${textClass} rounded hover:opacity-80">
+                        取消
+                      </button>
+                      <button onclick="event.stopPropagation(); planner.saveMemoContent(document.getElementById('memo-new').value);"
+                              class="px-2 py-1 text-xs bg-amber-500 text-white rounded hover:bg-amber-600">
+                        保存
+                      </button>
+                    </div>
+                  </div>
+                ` : ''}
+              `}
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+    
+    return entryButton;
+  }
+
+  // 生成复制任务弹窗HTML
+  private generateCopyModalHTML(): string {
+    if (!this.showCopyModal || !this.copyingTask) return '';
+
+    const year = this.currentDate.getFullYear();
+    const month = this.currentDate.getMonth();
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const currentDateKey = this.selectedDate ? this.formatDate(this.selectedDate) : '';
+
+    const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
+
+    // 生成本月日期列表
+    let dateList = '';
+    for (let day = 1; day <= lastDay; day++) {
+      const date = new Date(year, month, day);
+      const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const isSelected = this.selectedCopyDates.has(dateKey);
+      const isCurrentDay = dateKey === currentDateKey;
+      const dayTasks = this.tasks[dateKey] || [];
+      const dayOfWeek = date.getDay();
+      const weekDayName = weekDays[dayOfWeek];
+      
+      // 获取节假日信息
+      const holidayInfo = this.getHolidayInfo(date);
+      const isActualWorkday = this.isActualWorkday(date);
+      
+      // 确定日期标签和颜色
+      let dayLabel = `周${weekDayName}`;
+      let dayLabelColor = 'text-gray-500';
+      let specialTag = '';
+      
+      if (holidayInfo) {
+        if (holidayInfo.holiday) {
+          // 假日
+          dayLabelColor = 'text-red-500 font-medium';
+          specialTag = `<span class="text-[10px] bg-red-100 text-red-600 px-1 rounded ml-1">${holidayInfo.name}</span>`;
+        } else {
+          // 调休工作日
+          dayLabelColor = 'text-orange-500 font-medium';
+          specialTag = `<span class="text-[10px] bg-orange-100 text-orange-600 px-1 rounded ml-1">补班</span>`;
+        }
+      } else {
+        // 没有节假日数据时，使用默认的周末颜色
+        if (dayOfWeek === 0 || dayOfWeek === 6) {
+          dayLabelColor = 'text-red-400';
+        }
+      }
+
+      dateList += `
+        <button onclick="event.stopPropagation(); planner.toggleCopyDate('${dateKey}')"
+                class="flex items-center gap-2 p-2 rounded-lg ${isSelected ? 'bg-blue-50 border-2 border-blue-500' : 'bg-gray-50 hover:bg-gray-100'} ${isCurrentDay ? 'opacity-50 cursor-not-allowed' : ''}"
+                ${isCurrentDay ? 'disabled' : ''}>
+          <div class="w-5 h-5 rounded border-2 ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-gray-300'} flex items-center justify-center">
+            ${isSelected ? '<svg class="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>' : ''}
+          </div>
+          <div class="flex-1 text-left">
+            <div class="text-sm font-medium">
+              ${day}日 
+              <span class="text-xs ${dayLabelColor}">${dayLabel}</span>
+              ${specialTag}
+            </div>
+            <div class="text-xs text-gray-400">${dayTasks.length}个任务${!isActualWorkday && dayOfWeek >= 1 && dayOfWeek <= 5 ? ' · 休息日' : ''}${isActualWorkday && (dayOfWeek === 0 || dayOfWeek === 6) ? ' · 工作日' : ''}</div>
+          </div>
+        </button>
+      `;
+    }
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.closeCopyModal()">
+        <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-bold text-gray-800">复制任务到其他日期</h2>
+            <button onclick="planner.closeCopyModal()"
+                    class="p-2 hover:bg-gray-100 rounded-lg transition-colors">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="mb-6 p-4 bg-blue-50 rounded-lg">
+            <p class="text-sm text-gray-700">
+              <span class="font-semibold">任务内容：</span>
+              ${this.copyingTask.text}
+            </p>
+          </div>
+
+          <div class="mb-4">
+            <div class="grid grid-cols-3 gap-2 mb-4">
+              <button onclick="planner.toggleAllMonthDates(true)"
+                      class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors text-sm">
+                全选本月
+              </button>
+              <button onclick="planner.selectWorkdays()"
+                      class="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors text-sm">
+                全选工作日
+              </button>
+              <button onclick="planner.toggleAllMonthDates(false)"
+                      class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors text-sm">
+                取消全选
+              </button>
+            </div>
+            <p class="text-sm text-gray-500 mb-2">
+              已选择 <span class="font-semibold text-blue-600">${this.selectedCopyDates.size}</span> 个日期
+              <span class="text-xs text-gray-400 ml-2">（节假日/补班会自动识别，全选工作日会排除休息日并包含调休日）</span>
+            </p>
+          </div>
+
+          <div class="grid grid-cols-4 gap-2 mb-6 max-h-64 overflow-y-auto">
+            ${dateList}
+          </div>
+
+          <div class="flex gap-3">
+            <button onclick="planner.closeCopyModal()"
+                    class="flex-1 px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors">
+              取消
+            </button>
+            <button onclick="planner.confirmCopyTask()"
+                    class="flex-1 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors">
+              确认复制
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成标签管理弹窗HTML
+  private generateTagManagerHTML(): string {
+    if (!this.showTagManager) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600' : 'bg-white border-gray-300';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+
+    // 获取排序后的所有标签
+    const sortedTags = this.getAllTags();
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.toggleTagManager()">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-bold ${textClass}">🏷️ 标签管理</h2>
+            <button onclick="planner.toggleTagManager()"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <!-- 添加新标签 -->
+          <div class="mb-6 p-4 ${cardBg} rounded-lg">
+            <h3 class="text-sm font-semibold ${textClass} mb-3">添加自定义标签</h3>
+            <div class="flex gap-2 mb-2">
+              <input type="text" id="newTagName" placeholder="标签名称"
+                     class="flex-1 px-3 py-2 border ${inputBg} rounded-lg text-sm ${isDark ? 'text-gray-100' : ''}">
+              <button type="button" onclick="planner.toggleIconPicker()"
+                      class="w-16 px-2 py-2 border ${inputBg} rounded-lg text-center hover:bg-gray-100 dark:hover:bg-gray-600 transition-colors flex items-center justify-center"
+                      title="点击选择图标">
+                <span id="selectedIconDisplay" class="w-5 h-5">${getSVGIconById(this.selectedIcon) || this.selectedIcon}</span>
+              </button>
+              <input type="hidden" id="newTagIcon" value="${this.selectedIcon}">
+            </div>
+            <div class="flex gap-1 mb-3">
+              <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">颜色：</span>
+              ${['bg-blue-100', 'bg-green-100', 'bg-purple-100', 'bg-red-100', 'bg-yellow-100', 'bg-pink-100', 'bg-orange-100', 'bg-indigo-100', 'bg-cyan-100', 'bg-teal-100'].map((color, idx) => `
+                <button type="button" onclick="document.getElementById('newTagColor').value = '${color}'; document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('ring-2')); this.classList.add('ring-2');"
+                        class="color-btn w-6 h-6 rounded-full ${color} border border-gray-300 ${idx === 0 ? 'ring-2 ring-blue-500' : ''}"
+                        data-color="${color}"></button>
+              `).join('')}
+              <input type="hidden" id="newTagColor" value="bg-blue-100">
+            </div>
+            <button onclick="planner.handleAddTag()"
+                    class="w-full px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors text-sm">
+              添加标签
+            </button>
+          </div>
+
+          ${this.generateIconPickerHTML()}
+
+          <!-- 标签管理（所有标签，可拖拽排序，可删除） -->
+          <div class="mb-4">
+            <h3 class="text-sm font-semibold ${textClass} mb-2">所有标签 <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">(拖拽调整顺序，点击 × 删除)</span></h3>
+            <div id="tag-sort-container" class="flex flex-wrap gap-2 p-3 ${cardBg} rounded-lg min-h-[60px]"
+                 ondragover="event.stopPropagation(); event.preventDefault();"
+                 ondrop="event.stopPropagation(); event.preventDefault();">
+              ${sortedTags.length > 0 ? sortedTags.map(tag => `
+                <span class="tag-sort-item inline-flex items-center gap-1 px-3 py-1.5 rounded-full ${tag.color} ${tag.textColor} cursor-move select-none group relative"
+                      draggable="true"
+                      data-tag-id="${tag.id}"
+                      ondragstart="planner.onTagDragStart(event, '${tag.id}')"
+                      ondragover="event.stopPropagation(); event.preventDefault(); this.classList.add('ring-2', 'ring-blue-400');"
+                      ondragleave="this.classList.remove('ring-2', 'ring-blue-400');"
+                      ondrop="planner.onTagDrop(event, '${tag.id}')"
+                      ondragend="event.stopPropagation(); this.classList.remove('ring-2', 'ring-blue-400');">
+                  ${getTagIconSVG(tag.id, tag.icon)} ${tag.name}
+                  <button onclick="event.stopPropagation(); planner.deleteTag('${tag.id}')"
+                          class="ml-1 w-4 h-4 rounded-full bg-black bg-opacity-20 hover:bg-opacity-40 flex items-center justify-center text-white text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="删除标签">×</button>
+                </span>
+              `).join('') : `<span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">暂无标签，请添加</span>`}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成图标选择器弹窗
+  private generateIconPickerHTML(): string {
+    if (!this.showIconPicker) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-[60]"
+           onclick="planner.showIconPicker = false; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-4 w-96 max-h-[80vh] overflow-hidden"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-medium ${textClass}">选择图标</span>
+            <button onclick="planner.showIconPicker = false; planner.render();"
+                    class="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded">
+              <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          <div class="overflow-y-auto max-h-[65vh] space-y-4">
+            ${SVG_ICON_CATEGORIES.map(cat => `
+              <div>
+                <div class="text-xs font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'} mb-2">${cat.name}</div>
+                <div class="grid grid-cols-8 gap-1.5">
+                  ${cat.icons.map(icon => `
+                    <button onclick="planner.selectIcon('${icon.id}')"
+                            class="w-8 h-8 flex items-center justify-center rounded-lg transition-all ${this.selectedIcon === icon.id ? 'bg-blue-100 dark:bg-blue-900 ring-2 ring-blue-500' : 'hover:bg-gray-100 dark:hover:bg-gray-700'}"
+                            title="${icon.name}">
+                      <span class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}">${icon.svg}</span>
+                    </button>
+                  `).join('')}
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成快速标签选择器
+  private generateQuickTagSelectorHTML(): string {
+    if (!this.quickTagTaskId) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    
+    // 获取当前任务的标签
+    let currentTags: string[] = [];
+    if (this.selectedDate) {
+      const dateKey = this.formatDate(this.selectedDate);
+      const task = (this.tasks[dateKey] || []).find(t => t.id === this.quickTagTaskId);
+      if (task) currentTags = task.tags || [];
+    }
+    
+    const allTags = this.getAllTags();
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50"
+           onclick="planner.quickTagTaskId = ''; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-4 w-72"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-medium ${textClass}">选择标签</span>
+            <button onclick="planner.quickTagTaskId = ''; planner.render();"
+                    class="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded">
+              <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            ${allTags.map(tag => `
+              <button onclick="planner.toggleTaskTag('${tag.id}')"
+                      title="${tag.name}"
+                      class="inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-sm ${tag.color} ${tag.textColor} ${currentTags.includes(tag.id) ? 'ring-2 ring-offset-1 ring-blue-500' : ''} hover:opacity-80 transition-opacity">
+                ${getTagIconSVG(tag.id, tag.icon)} ${tag.name} ${currentTags.includes(tag.id) ? '✓' : ''}
+              </button>
+            `).join('')}
+          </div>
+          <div class="mt-3 pt-3 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}">
+            <button onclick="planner.quickTagTaskId = ''; planner.render();"
+                    class="w-full py-2 text-sm ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} ${textClass} rounded-lg transition-colors">
+              完成
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 处理添加标签
+  private handleAddTag(): void {
+    const nameInput = document.getElementById('newTagName') as HTMLInputElement;
+    const colorInput = document.getElementById('newTagColor') as HTMLInputElement;
+
+    const name = nameInput.value.trim();
+    const icon = this.selectedIcon || '🏷️';
+    const color = colorInput.value;
+
+    if (!name) {
+      alert('请输入标签名称');
+      return;
+    }
+
+    this.addCustomTag(name, color, icon);
+    nameInput.value = '';
+    this.selectedIcon = '🏷️';  // 重置为默认图标
+  }
+
+  // 生成月度统计弹窗HTML
+  private generateStatsModalHTML(): string {
+    if (!this.showStatsModal) return '';
+    const stats = this.getMonthlyStats();
+    const filteredTasks = this.getFilteredMonthlyTasks();
+
+    const circumference = 2 * Math.PI * 45;
+    const offset = circumference - (stats.percentage / 100) * circumference;
+
+    let tasksOverview = '';
+    const recentTasks = filteredTasks; // 显示所有任务
+
+    recentTasks.forEach(({ date, task }) => {
+      tasksOverview += `
+        <div class="flex items-center gap-3 p-3 bg-gray-50 rounded-lg group hover:bg-gray-100 transition-colors">
+          <input type="checkbox"
+                 ${task.completed ? 'checked' : ''}
+                 onchange="planner.toggleMonthlyTask('${date}', '${task.id}')"
+                 class="w-5 h-5 rounded border-gray-300 text-blue-500 focus:ring-blue-500 cursor-pointer">
+          <span class="flex-1 text-sm ${task.completed ? 'line-through text-gray-400' : 'text-gray-700'} truncate">${task.text}</span>
+          <span class="text-xs text-gray-400">${date.slice(5)}</span>
+          <button onclick="planner.deleteMonthlyTask('${date}', '${task.id}')"
+                  class="opacity-0 group-hover:opacity-100 p-1 text-red-500 hover:bg-red-100 rounded transition-all">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+      `;
+    });
+
+    if (recentTasks.length === 0) {
+      tasksOverview = '<p class="text-gray-400 text-center py-4 text-sm">暂无任务</p>';
+    }
+
+    const getCardClass = (filterType: MonthlyFilter) => {
+      const baseClass = 'stats-card rounded-lg p-4 text-center cursor-pointer ';
+      if (this.monthlyFilter === filterType) {
+        return baseClass + 'ring-4 ring-blue-300 ring-opacity-50 shadow-lg';
+      }
+      return baseClass;
+    };
+
+    const statsTitle = this.viewMode === 'month' ? '本月任务统计' : '本周任务统计';
+    const overviewTitle = this.viewMode === 'month' ? '本月任务概览' : '本周任务概览';
+
+    return `
+      <div class="modal-backdrop fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.toggleStatsModal()">
+        <div class="stats-modal bg-white rounded-xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-bold text-gray-800">${statsTitle}</h2>
+            <button onclick="planner.toggleStatsModal()"
+                    class="p-2 hover:bg-gray-100 rounded-lg transition-colors">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-3 gap-4 mb-6">
+            <div onclick="planner.setMonthlyFilter('all')"
+                    class="${getCardClass('all')} bg-gradient-to-br from-blue-50 to-blue-100">
+              <div class="text-2xl font-bold text-blue-600">${stats.total}</div>
+              <div class="text-xs text-gray-600 mt-1">总任务数</div>
+            </div>
+            <div onclick="planner.setMonthlyFilter('completed')"
+                    class="${getCardClass('completed')} bg-gradient-to-br from-green-50 to-green-100">
+              <div class="text-2xl font-bold text-green-600">${stats.completed}</div>
+              <div class="text-xs text-gray-600 mt-1">已完成</div>
+            </div>
+            <div onclick="planner.setMonthlyFilter('pending')"
+                    class="${getCardClass('pending')} bg-gradient-to-br from-orange-50 to-orange-100">
+              <div class="text-2xl font-bold text-orange-600">${stats.pending}</div>
+              <div class="text-xs text-gray-600 mt-1">未完成</div>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-center mb-6">
+            <div class="relative">
+              <svg width="120" height="120" class="transform -rotate-90">
+                <circle cx="60" cy="60" r="45" stroke="#e5e7eb" stroke-width="8" fill="none"/>
+                <circle cx="60" cy="60" r="45" stroke="#10b981" stroke-width="8" fill="none"
+                        stroke-linecap="round" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                        class="transition-all duration-500 ease-in-out"/>
+              </svg>
+              <div class="absolute inset-0 flex items-center justify-center">
+                <span class="text-2xl font-bold text-gray-800">${stats.percentage}%</span>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <h3 class="text-sm font-semibold text-gray-700 mb-3">${overviewTitle}</h3>
+            <div class="space-y-2 max-h-96 overflow-y-auto">
+              ${tasksOverview}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 更多菜单显示状态
+  private showMoreMenu: boolean = false;
+
+  // ==================== 自动更新状态 ====================
+  private updateAvailable: boolean = false;
+  private updateInfo: { version: string; releaseDate?: string; releaseNotes?: string } | null = null;
+  private updateDownloaded: boolean = false;
+  private downloadProgress: { percent: number } | null = null;
+  private showUpdateModal: boolean = false;
+  private checkingForUpdate: boolean = false;
+  private isManualCheck: boolean = false;  // 是否是手动检查更新
+  private isAlwaysOnTop: boolean = false;  // 窗口是否置顶
+
+  private toggleMoreMenu(): void {
+    this.showMoreMenu = !this.showMoreMenu;
+    // 打开更多菜单时，关闭其他弹窗
+    if (this.showMoreMenu) {
+      this.showThemeMenu = false;
+      this.showNotificationPanel = false;
+    }
+    this.render();
+  }
+
+  // 生成更多菜单
+  private generateMoreMenuHTML(): string {
+    if (!this.showMoreMenu) return '';
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-100';
+    const textClass = isDark ? 'text-gray-200' : 'text-gray-700';
+    const hoverClass = isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100';
+
+    return `
+      <div class="fixed inset-0 z-40" onclick="planner.toggleMoreMenu()">
+        <div class="absolute right-4 top-20 ${bgClass} rounded-lg shadow-xl border py-2 min-w-[200px]" onclick="event.stopPropagation()">
+          <button onclick="planner.showAnniversaryModal = true; planner.showMoreMenu = false; planner.render();"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 15.546c-.523 0-1.046.151-1.5.454a2.704 2.704 0 01-3 0 2.704 2.704 0 00-3 0 2.704 2.704 0 01-3 0 2.704 2.704 0 00-3 0 2.704 2.704 0 01-3 0 2.701 2.701 0 00-1.5-.454M9 6v2m3-2v2m3-2v2M9 3h.01M12 3h.01M15 3h.01M21 21v-7a2 2 0 00-2-2H5a2 2 0 00-2 2v7h18zm-3-9v-2a2 2 0 00-2-2H8a2 2 0 00-2 2v2h12z"/>
+            </svg>
+            纪念日管理
+          </button>
+          <button onclick="planner.showReminderSettings = true; planner.showMoreMenu = false; planner.render();"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+            </svg>
+            提醒设置
+          </button>
+          <div class="border-t ${isDark ? 'border-gray-700' : ''} my-1"></div>
+          <button onclick="planner.showShortcutHelp = true; planner.showMoreMenu = false; planner.render();"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+            快捷键
+          </button>
+          <div class="border-t ${isDark ? 'border-gray-700' : ''} my-1"></div>
+          <button onclick="planner.importFromJSON(); planner.showMoreMenu = false;"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+            </svg>
+            导入数据
+          </button>
+          <button onclick="planner.exportToJSON()"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            导出 JSON
+          </button>
+          <button onclick="planner.exportToCSV()"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+            </svg>
+            导出 CSV
+          </button>
+          <div class="border-t ${isDark ? 'border-gray-700' : ''} my-1"></div>
+          <button onclick="planner.checkForUpdate(); planner.showMoreMenu = false;"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+            </svg>
+            检查更新
+          </button>
+          <div class="border-t ${isDark ? 'border-gray-700' : ''} my-1"></div>
+          <button onclick="planner.showContactInfo = true; planner.showMoreMenu = false; planner.render();"
+                  class="flex items-center gap-2 px-4 py-2 w-full ${textClass} ${hoverClass} transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/>
+            </svg>
+            联系作者
+          </button>
+          <div class="border-t ${isDark ? 'border-gray-700' : ''} my-1"></div>
+          <div class="px-4 py-2 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'} text-center">
+            每日规划 v${APP_VERSION}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成四象限视图HTML
+  private generateQuadrantViewHTML(): string {
+    if (!this.showQuadrantView) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const quadrantTasks = this.getQuadrantTasks();
+
+    // 生成单个象限的任务列表
+    const generateQuadrantTasks = (tasks: Task[], priority: TaskPriority, colorClass: string): string => {
+      const config = PRIORITY_CONFIG[priority];
+      const completedCount = tasks.filter(t => t.completed).length;
+      
+      return `
+        <div class="rounded-xl p-4 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} border-2 ${config.borderColor} border-opacity-30">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <span class="w-3 h-3 rounded-full ${config.bgColor}"></span>
+              <h3 class="font-semibold ${textClass}">${config.label}</h3>
+            </div>
+            <div class="flex items-center gap-2 text-xs">
+              <span class="${isDark ? 'text-gray-400' : 'text-gray-500'}">${tasks.length}个任务</span>
+              ${tasks.length > 0 ? `<span class="px-2 py-0.5 rounded ${config.bgColor} ${config.color}">${completedCount}/${tasks.length}完成</span>` : ''}
+            </div>
+          </div>
+          <div class="space-y-2 max-h-60 overflow-y-auto">
+            ${tasks.length > 0 ? tasks.map(task => `
+              <div class="flex items-center gap-2 p-2 rounded ${isDark ? 'bg-gray-600 hover:bg-gray-550' : 'bg-white hover:bg-gray-100'} transition-colors cursor-pointer group"
+                   onclick="planner.jumpToDate('${task.date}')">
+                <input type="checkbox" ${task.completed ? 'checked' : ''} 
+                       class="w-4 h-4 rounded cursor-pointer"
+                       onclick="event.stopPropagation()">
+                <span class="flex-1 text-sm ${task.completed ? 'line-through text-gray-400' : textClass} truncate">${task.text}</span>
+                <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">${task.date}</span>
+              </div>
+            `).join('') : `<p class="text-center ${isDark ? 'text-gray-500' : 'text-gray-400'} py-4 text-sm">暂无任务</p>`}
+          </div>
+        </div>
+      `;
+    };
+
+    // 时间筛选按钮
+    const filterButtons = `
+      <div class="flex items-center gap-2 mb-4 flex-wrap">
+        <button onclick="planner.setQuadrantFilter('year')"
+                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors ${this.quadrantFilter === 'year' 
+                  ? 'bg-blue-500 text-white' 
+                  : (isDark ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}">
+          本年度
+        </button>
+        <button onclick="planner.setQuadrantFilter('month')"
+                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors ${this.quadrantFilter === 'month' 
+                  ? 'bg-blue-500 text-white' 
+                  : (isDark ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}">
+          本月度
+        </button>
+        <button onclick="planner.setQuadrantFilter('custom')"
+                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors ${this.quadrantFilter === 'custom' 
+                  ? 'bg-blue-500 text-white' 
+                  : (isDark ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}">
+          自定义
+        </button>
+        ${this.quadrantFilter === 'custom' ? `
+          <div class="flex items-center gap-2 ml-2">
+            <input type="date" value="${this.quadrantStartDate}" 
+                   onchange="planner.setQuadrantDateRange('start', this.value)"
+                   class="px-3 py-1.5 rounded-lg border ${isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300'} text-sm">
+            <span class="${isDark ? 'text-gray-400' : 'text-gray-500'}">至</span>
+            <input type="date" value="${this.quadrantEndDate}" 
+                   onchange="planner.setQuadrantDateRange('end', this.value)"
+                   class="px-3 py-1.5 rounded-lg border ${isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300'} text-sm">
+          </div>
+        ` : ''}
+      </div>
+    `;
+
+    // 统计数据
+    const totalTasks = quadrantTasks.urgentImportant.length + quadrantTasks.important.length + 
+                       quadrantTasks.urgent.length + quadrantTasks.normal.length;
+    const totalCompleted = quadrantTasks.urgentImportant.filter(t => t.completed).length +
+                          quadrantTasks.important.filter(t => t.completed).length +
+                          quadrantTasks.urgent.filter(t => t.completed).length +
+                          quadrantTasks.normal.filter(t => t.completed).length;
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.toggleQuadrantView()">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-5xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-xl font-bold ${textClass}">四象限任务分析</h2>
+              <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'} mt-1">
+                时间范围：${this.quadrantStartDate} 至 ${this.quadrantEndDate}
+                | 共 ${totalTasks} 个任务，已完成 ${totalCompleted} 个
+              </p>
+            </div>
+            <button onclick="planner.toggleQuadrantView()"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          ${filterButtons}
+
+          <!-- 四象限矩阵 -->
+          <div class="grid grid-cols-2 gap-4">
+            <!-- 紧急重要 -->
+            ${generateQuadrantTasks(quadrantTasks.urgentImportant, 'urgent-important', 'red')}
+            
+            <!-- 重要不急 -->
+            ${generateQuadrantTasks(quadrantTasks.important, 'important', 'yellow')}
+            
+            <!-- 紧急不重要 -->
+            ${generateQuadrantTasks(quadrantTasks.urgent, 'urgent', 'orange')}
+            
+            <!-- 不重要不急 -->
+            ${generateQuadrantTasks(quadrantTasks.normal, 'normal', 'gray')}
+          </div>
+
+          <!-- 提示信息 -->
+          <div class="mt-4 p-3 ${isDark ? 'bg-blue-900/30' : 'bg-blue-50'} rounded-lg">
+            <p class="text-xs ${isDark ? 'text-blue-300' : 'text-blue-700'}">
+              💡 <strong>四象限法则</strong>：优先处理"紧急重要"的任务，合理安排"重要不急"的任务，委托或快速处理"紧急不重要"的任务，考虑是否需要"不重要不急"的任务。点击任务可跳转到对应日期。
+            </p>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成搜索面板（下拉面板，非弹窗）
+  private generateSearchPanelHTML(): string {
+    if (!this.showSearchPanel) return '';
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300';
+    const textClass = isDark ? 'text-gray-200' : 'text-gray-700';
+
+    const results = this.searchQuery ? this.searchTasks(this.searchQuery) : [];
+
+    return `
+      <div class="absolute left-4 top-20 ${bgClass} rounded-xl shadow-2xl border p-4 w-[400px] max-h-[60vh] overflow-y-auto z-50"
+           onclick="event.stopPropagation()">
+        <div class="flex items-center gap-2 mb-3">
+          <svg class="w-5 h-5 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+          </svg>
+          <input type="text"
+                 placeholder="搜索任务..."
+                 value="${this.searchQuery}"
+                 oninput="planner.performSearch(this.value)"
+                 class="flex-1 px-3 py-2 border ${inputBg} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                 autofocus>
+          <button onclick="planner.showSearchPanel = false; planner.searchQuery = ''; planner.render();"
+                  class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+            <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+        <div id="searchResults" class="space-y-1">
+          ${results.length > 0 ? results.map(({ date, task }) => `
+            <div class="flex items-center gap-2 p-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-50 hover:bg-gray-100'} rounded-lg cursor-pointer transition-colors text-sm"
+                 onclick="planner.jumpToDate('${date}')">
+              <input type="checkbox" ${task.completed ? 'checked' : ''} class="pointer-events-none" disabled>
+              <span class="flex-1 truncate ${task.completed ? 'line-through text-gray-400' : textClass}">${task.text}</span>
+              <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">${date}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded ${getPriorityConfig(task.priority).bgColor} ${getPriorityConfig(task.priority).color}">${getPriorityConfig(task.priority).shortLabel}</span>
+            </div>
+          `).join('') : this.searchQuery ? `<p class="text-center text-gray-400 py-4 text-sm">未找到匹配的任务</p>` : `<p class="text-center text-gray-400 py-4 text-sm">输入关键词搜索任务</p>`}
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成年度统计弹窗
+  // 生成总结按钮区域（日历下方）
+  private generateSummaryButtonsHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-700/50' : 'bg-gray-50';
+    const textClass = isDark ? 'text-gray-300' : 'text-gray-600';
+    
+    // 获取快速统计数据
+    const weeklyStats = this.getWeeklyStats();
+    const weeklyRate = weeklyStats.percentage;
+    
+    return `
+      <div class="mt-4 p-4 ${bgClass} rounded-xl">
+        <div class="flex items-center justify-center gap-3">
+          <button onclick="event.stopPropagation(); planner.openWeeklySummary();"
+                  class="flex-1 flex flex-col items-center gap-1 p-3 rounded-lg ${isDark ? 'bg-gray-600 hover:bg-gray-500' : 'bg-white hover:bg-gray-100'} shadow-sm transition-all group">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+              </svg>
+              <span class="text-sm font-medium ${textClass}">周总结</span>
+            </div>
+            <div id="weekly-summary-rate" class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">${weeklyRate}% 完成</div>
+          </button>
+          <button onclick="event.stopPropagation(); planner.openMonthlySummary();"
+                  class="flex-1 flex flex-col items-center gap-1 p-3 rounded-lg ${isDark ? 'bg-gray-600 hover:bg-gray-500' : 'bg-white hover:bg-gray-100'} shadow-sm transition-all group">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+              </svg>
+              <span class="text-sm font-medium ${textClass}">月总结</span>
+            </div>
+            <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">本月表现</div>
+          </button>
+          <button onclick="event.stopPropagation(); planner.openYearlyStats();"
+                  class="flex-1 flex flex-col items-center gap-1 p-3 rounded-lg ${isDark ? 'bg-gray-600 hover:bg-gray-500' : 'bg-white hover:bg-gray-100'} shadow-sm transition-all group">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/>
+              </svg>
+              <span class="text-sm font-medium ${textClass}">年度总结</span>
+            </div>
+            <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">年度回顾</div>
+          </button>
+        </div>
+        <!-- 知识库入口 -->
+        <div class="mt-3 pt-3 border-t ${isDark ? 'border-gray-600' : 'border-gray-200'}">
+          <button onclick="event.stopPropagation(); planner.openKnowledgeBase();"
+                  class="w-full flex items-center justify-center gap-2 p-3 rounded-lg ${isDark ? 'bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-500 hover:to-blue-500' : 'bg-gradient-to-r from-purple-500 to-blue-500 hover:from-purple-400 hover:to-blue-400'} text-white shadow-md transition-all">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
+            </svg>
+            <span class="text-sm font-medium">个人知识库</span>
+            <span class="text-xs opacity-75">(${this.knowledgeGuides.length})</span>
+          </button>
+        </div>
+      </div>
+    `;
+  }
+  
+  // 打开知识库（关闭其他面板）
+  public openKnowledgeBase(): void {
+    this.showKnowledgeBase = true;
+    this.knowledgeSearchKeyword = '';  // 清除搜索关键词
+    // 关闭任务面板并清除选中日期
+    this.showTaskPanel = false;
+    this.selectedDate = null;
+    this.hoveredDate = null;
+    // 关闭其他弹窗
+    this.showStatsModal = false;
+    this.showCopyModal = false;
+    this.showThemeMenu = false;
+    this.showQuadrantView = false;
+    this.showWeeklySummary = false;
+    this.showMonthlySummary = false;
+    this.showYearlyStats = false;
+    this.currentGuide = null;
+    this.render();
+  }
+  
+  // 从任务跳转到关联的知识库（只读查看模式）
+  public openGuideFromTask(guideId: string): void {
+    const guide = this.knowledgeGuides.find(g => g.id === guideId);
+    if (guide) {
+      this.showKnowledgeBase = true;
+      this.currentGuide = { ...guide, steps: [...guide.steps] };  // 复制一份用于显示
+      this.viewingGuideId = guideId;  // 设置为查看模式
+      this.editingGuideId = '';  // 清除编辑模式
+      this.knowledgeSearchKeyword = '';
+      // 关闭任务面板
+      this.showTaskPanel = false;
+      this.selectedDate = null;
+      this.hoveredDate = null;
+      // 关闭其他弹窗
+      this.showStatsModal = false;
+      this.showCopyModal = false;
+      this.showThemeMenu = false;
+      this.showQuadrantView = false;
+      this.showWeeklySummary = false;
+      this.showMonthlySummary = false;
+      this.showYearlyStats = false;
+      this.render();
+    }
+  }
+  
+  // 打开周总结（关闭其他面板）
+  public openWeeklySummary(): void {
+    this.showWeeklySummary = true;
+    // 不关闭任务面板，让弹窗覆盖在上面
+    this.closeOtherPanels();
+    this.render();
+  }
+  
+  // 打开月总结（关闭其他面板）
+  public openMonthlySummary(): void {
+    this.showMonthlySummary = true;
+    // 不关闭任务面板，让弹窗覆盖在上面
+    this.closeOtherPanels();
+    this.render();
+  }
+  
+  // 打开年度总结（关闭其他面板）
+  public openYearlyStats(): void {
+    this.showYearlyStats = true;
+    // 不关闭任务面板，让弹窗覆盖在上面
+    this.closeOtherPanels();
+    this.render();
+  }
+  
+  // 关闭其他所有面板和弹窗
+  private closeOtherPanels(): void {
+    this.showKnowledgeBase = false;
+    this.showStatsModal = false;
+    this.showCopyModal = false;
+    this.showThemeMenu = false;
+    this.showQuadrantView = false;
+    this.currentGuide = null;
+  }
+
+  // 生成知识库弹窗 HTML
+  private generateKnowledgeBaseHTML(): string {
+    if (!this.showKnowledgeBase) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-800';
+    
+    // 如果正在查看某个指南（只读模式）
+    if (this.viewingGuideId && this.currentGuide) {
+      return this.generateGuideViewerHTML(isDark, bgClass, textClass, inputBg);
+    }
+    
+    // 如果正在编辑某个指南，显示编辑页面
+    if (this.currentGuide) {
+      return this.generateGuideEditorHTML(isDark, bgClass, textClass, inputBg);
+    }
+    
+    // 否则显示指南列表页面
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.closeKnowledgeBase();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-5xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          
+          <!-- 标题 -->
+          <div class="flex items-center justify-between mb-6">
+            <div class="flex items-center gap-3">
+              <span class="text-3xl">📚</span>
+              <div>
+                <h2 class="text-xl font-bold ${textClass}">个人知识库</h2>
+                <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">管理你的步骤指南和教程</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <!-- 导入按钮 -->
+              <button onclick="planner.importKnowledgeBase()"
+                      class="p-2 ${isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'} rounded-lg transition-colors"
+                      title="导入知识库">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+                </svg>
+              </button>
+              <!-- 导出按钮 -->
+              <button onclick="planner.exportKnowledgeBase()"
+                      class="p-2 ${isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'} rounded-lg transition-colors"
+                      title="导出知识库">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                </svg>
+              </button>
+              <button onclick="planner.closeKnowledgeBase();"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          
+          <!-- 搜索框 -->
+          <div class="mb-4">
+            <div class="relative">
+              <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+              </svg>
+              <input type="text" 
+                     placeholder="搜索指南标题或步骤内容..." 
+                     value="${this.knowledgeSearchKeyword}"
+                     oninput="planner.searchKnowledgeGuides(this.value)"
+                     class="w-full pl-10 pr-10 py-2.5 ${inputBg} border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+              ${this.knowledgeSearchKeyword ? `
+                <button onclick="planner.clearKnowledgeSearch()"
+                        class="absolute right-3 top-1/2 -translate-y-1/2 p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-full transition-colors">
+                  <svg class="w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              ` : ''}
+            </div>
+          </div>
+          
+          <!-- 新建指南按钮 -->
+          <button onclick="planner.createNewGuide()"
+                  class="w-full mb-4 p-4 border-2 border-dashed ${isDark ? 'border-gray-600 hover:border-purple-500 hover:bg-gray-700' : 'border-gray-300 hover:border-purple-400 hover:bg-purple-50'} rounded-xl transition-all flex items-center justify-center gap-2">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+            </svg>
+            <span class="${isDark ? 'text-gray-300' : 'text-gray-600'}">创建新指南</span>
+          </button>
+          
+          <!-- 指南列表 -->
+          <div id="guideListContainer">
+          ${(() => {
+            const filteredGuides = this.getFilteredKnowledgeGuides();
+            const hasKeyword = this.knowledgeSearchKeyword.trim().length > 0;
+            
+            if (this.knowledgeGuides.length === 0) {
+              return `
+                <div class="text-center py-12">
+                  <svg class="w-16 h-16 mx-auto mb-4 ${isDark ? 'text-gray-600' : 'text-gray-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
+                  </svg>
+                  <p class="${isDark ? 'text-gray-400' : 'text-gray-500'}">还没有任何指南</p>
+                  <p class="text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-2">点击上方按钮创建你的第一个指南，或导入已有知识库</p>
+                </div>
+              `;
+            }
+            
+            if (hasKeyword && filteredGuides.length === 0) {
+              return `
+                <div class="text-center py-12">
+                  <svg class="w-16 h-16 mx-auto mb-4 ${isDark ? 'text-gray-600' : 'text-gray-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                  </svg>
+                  <p class="${isDark ? 'text-gray-400' : 'text-gray-500'}">没有找到匹配的内容</p>
+                  <p class="text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-2">尝试其他关键词</p>
+                </div>
+              `;
+            }
+            
+            return `
+              ${hasKeyword ? `
+                <div class="mb-3 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">
+                  找到 ${filteredGuides.length} 个匹配的指南
+                </div>
+              ` : ''}
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                ${filteredGuides.map(guide => {
+                  // 获取匹配的内容摘要
+                  const matchInfo = this.getGuideMatchInfo(guide);
+                  return `
+                    <div class="p-4 min-h-[92px] ${isDark ? 'bg-gray-700 hover:bg-gray-650' : 'bg-gray-50 hover:bg-gray-100'} rounded-lg transition-all cursor-pointer group"
+                         onclick="planner.openGuideEdit('${guide.id}')">
+                      <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-3 flex-1 min-w-0">
+                          <span class="w-8 h-8 flex items-center justify-center bg-purple-100 dark:bg-purple-900/50 rounded-lg flex-shrink-0">
+                            <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                            </svg>
+                          </span>
+                          <div class="flex-1 min-w-0">
+                            <h3 class="font-medium ${textClass} truncate">${this.highlightKeyword(guide.name, this.knowledgeSearchKeyword)}</h3>
+                            <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${guide.steps.length} 个步骤 · 更新于 ${new Date(guide.updatedAt).toLocaleDateString()}</p>
+                            ${matchInfo ? `
+                              <p class="text-xs ${isDark ? 'text-purple-400' : 'text-purple-600'} mt-1 truncate">
+                                ${matchInfo}
+                              </p>
+                            ` : ''}
+                          </div>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                          <button onclick="event.stopPropagation(); planner.deleteGuide('${guide.id}')"
+                                  class="p-2 opacity-0 group-hover:opacity-100 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-all">
+                            <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                            </svg>
+                          </button>
+                          <svg class="w-5 h-5 ${isDark ? 'text-gray-500' : 'text-gray-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                          </svg>
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            `;
+          })()}
+          </div>
+        </div>
+      </div>
+      ${this.generateEnlargedImageHTML()}
+      ${this.generateGuideSaveConfirmHTML()}
+    `;
+  }
+
+  // 生成指南保存确认弹窗 HTML
+  private generateGuideSaveConfirmHTML(): string {
+    if (!this.showGuideSaveConfirm) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    
+    return `
+      <div class="fixed inset-0 bg-black/60 backdrop-blur-md flex items-center justify-center z-[70]">
+        <div class="${isDark ? 'bg-gray-800' : 'bg-white'} rounded-3xl shadow-2xl p-8 w-full max-w-md transform transition-all duration-300 scale-100 opacity-100"
+             onclick="event.stopPropagation()">
+          
+          <!-- 图标动画 -->
+          <div class="flex justify-center mb-6">
+            <div class="w-20 h-20 rounded-full ${isDark ? 'bg-amber-900/30' : 'bg-amber-100'} flex items-center justify-center">
+              <svg class="w-10 h-10 text-amber-500 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+              </svg>
+            </div>
+          </div>
+          
+          <!-- 标题 -->
+          <h3 class="text-xl font-bold text-center ${isDark ? 'text-gray-100' : 'text-gray-800'} mb-2">
+            离开前是否保存？
+          </h3>
+          
+          <!-- 描述 -->
+          <p class="text-center ${isDark ? 'text-gray-400' : 'text-gray-500'} mb-8">
+            您有未保存的更改，离开将会丢失这些内容
+          </p>
+          
+          <!-- 按钮组 -->
+          <div class="flex flex-col gap-3">
+            <!-- 保存按钮 -->
+            <button onclick="planner.confirmSaveAndClose();"
+                    class="w-full py-3.5 bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 text-white font-medium rounded-xl transition-all duration-200 flex items-center justify-center gap-2 shadow-lg shadow-purple-500/25 hover:shadow-purple-500/40">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+              </svg>
+              保存并关闭
+            </button>
+            
+            <!-- 不保存按钮 -->
+            <button onclick="planner.confirmDiscardGuide();"
+                    class="w-full py-3.5 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} ${isDark ? 'text-gray-300' : 'text-gray-700'} font-medium rounded-xl transition-all duration-200 flex items-center justify-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+              不保存
+            </button>
+            
+            <!-- 取消按钮 -->
+            <button onclick="planner.cancelGuideSaveConfirm();"
+                    class="w-full py-3 text-${isDark ? 'gray-400 hover:text-gray-300' : 'gray-500 hover:text-gray-600'} font-medium rounded-xl transition-all duration-200">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成图片放大弹窗 HTML
+  private generateEnlargedImageHTML(): string {
+    if (!this.enlargedImageUrl) return '';
+    const zoomPercent = Math.round(this.enlargedImageScale * 100);
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-90 z-[60] p-4"
+           onclick="planner.closeEnlargedImage();">
+        <div class="relative w-full h-full max-w-[96vw] max-h-[92vh] mx-auto flex flex-col"
+             onclick="event.stopPropagation();">
+          <div id="enlarged-image-viewport" class="flex-1 overflow-auto rounded-lg"
+               onwheel="event.preventDefault(); planner.zoomEnlargedImage(event.deltaY < 0 ? 0.1 : -0.1)">
+            <div id="enlarged-image-canvas" class="min-w-full min-h-full flex items-center justify-center p-12"
+                 style="width:${Math.max(100, this.enlargedImageScale * 100)}%;height:${Math.max(100, this.enlargedImageScale * 100)}%;">
+              <img id="enlarged-knowledge-image" src="${this.enlargedImageUrl}"
+                   class="max-w-[88vw] max-h-[76vh] object-contain rounded-lg shadow-2xl select-none"
+                   style="transform:scale(${this.enlargedImageScale});transform-origin:center;transition:transform 120ms ease;"
+                   ondblclick="planner.zoomEnlargedImage(0.25)"
+                   draggable="false">
+            </div>
+          </div>
+
+          <div class="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 p-1 bg-gray-900/90 border border-white/20 rounded-lg shadow-xl">
+            <button onclick="planner.zoomEnlargedImage(-0.1)" class="w-9 h-9 text-xl text-white hover:bg-white/15 rounded-md" title="缩小">−</button>
+            <button id="enlarged-image-zoom" onclick="planner.resetEnlargedImageZoom()" class="min-w-[64px] h-9 px-2 text-sm text-white hover:bg-white/15 rounded-md" title="恢复原始大小">${zoomPercent}%</button>
+            <button onclick="planner.zoomEnlargedImage(0.1)" class="w-9 h-9 text-xl text-white hover:bg-white/15 rounded-md" title="放大">+</button>
+          </div>
+
+          <!-- 关闭按钮 -->
+          <button onclick="planner.closeEnlargedImage();"
+                  class="absolute top-3 right-3 p-2 bg-white hover:bg-gray-100 rounded-full shadow-lg transition-colors"
+                  title="关闭">
+            <svg class="w-5 h-5 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+          <!-- 删除按钮（仅当有stepId时显示） -->
+          ${this.enlargedImageStepId ? `
+            <button onclick="planner.deleteEnlargedImage();"
+                    class="absolute top-3 left-3 p-2 bg-red-500 hover:bg-red-600 rounded-full shadow-lg transition-colors"
+                    title="删除图片">
+              <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+              </svg>
+            </button>
+          ` : ''}
+          <!-- 提示文字 -->
+          <p class="text-center text-white text-sm mt-2 opacity-70">滚轮或 +/- 缩放，双击放大，点击背景关闭${this.enlargedImageStepId ? ' · 左上角删除' : ''}</p>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成指南查看器 HTML（只读模式）
+  private generateGuideViewerHTML(isDark: boolean, bgClass: string, textClass: string, inputBg: string): string {
+    if (!this.currentGuide) return '';
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.closeKnowledgeBase();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-6xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <!-- 顶部导航 -->
+          <div class="flex items-center justify-between mb-6">
+            <button onclick="planner.closeViewerMode()"
+                    class="flex items-center gap-2 px-3 py-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+              </svg>
+              <span class="${isDark ? 'text-gray-300' : 'text-gray-600'}">返回</span>
+            </button>
+            <div class="flex items-center gap-2">
+              <button onclick="planner.switchToEditMode()"
+                      class="px-4 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-lg transition-colors flex items-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+                编辑
+              </button>
+              <button onclick="planner.closeKnowledgeBase();"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          
+          <!-- 指南标题 -->
+          <div class="mb-6">
+            <h2 class="text-2xl font-bold ${textClass}">${this.currentGuide.name}</h2>
+          </div>
+          
+          <!-- 步骤列表（只读） -->
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+            ${this.currentGuide.steps.map((step, index) => {
+              // 合并旧的单图和新数组图
+              const allImages: string[] = [];
+              if (step.imageUrl) allImages.push(step.imageUrl);
+              if (step.images && step.images.length > 0) {
+                step.images.forEach(img => {
+                  if (!allImages.includes(img)) allImages.push(img);
+                });
+              }
+              return `
+                <div class="p-4 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} rounded-xl border ${isDark ? 'border-gray-600' : 'border-gray-200'}">
+                  <div class="flex items-center gap-3 mb-3">
+                    <span class="w-8 h-8 flex items-center justify-center ${isDark ? 'bg-purple-600' : 'bg-purple-500'} text-white text-sm font-bold rounded-full">${index + 1}</span>
+                    <span class="font-medium ${textClass}">${step.title || '未命名步骤'}</span>
+                  </div>
+                  ${step.content ? `<div class="ml-11 text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'} whitespace-pre-wrap">${step.content}</div>` : ''}
+                  ${allImages.length > 0 ? `
+                    <div class="ml-11 mt-3 flex flex-wrap gap-2">
+                      ${allImages.map(img => `
+                        <img src="${img}" class="max-w-[200px] max-h-[150px] rounded-lg cursor-pointer hover:opacity-90" 
+                             onclick="planner.enlargeImage('${img}', '${step.id}')" />
+                      `).join('')}
+                    </div>
+                  ` : ''}
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      </div>
+      ${this.generateEnlargedImageHTML()}
+    `;
+  }
+  
+  // 关闭查看模式
+  public closeViewerMode(): void {
+    this.viewingGuideId = '';
+    this.currentGuide = null;
+    this.render();
+  }
+  
+  // 切换到编辑模式
+  public switchToEditMode(): void {
+    if (this.viewingGuideId && this.currentGuide) {
+      this.editingGuideId = this.viewingGuideId;
+      this.viewingGuideId = '';
+      this.render();
+    }
+  }
+
+  // 生成指南编辑器 HTML
+  private generateGuideEditorHTML(isDark: boolean, bgClass: string, textClass: string, inputBg: string): string {
+    if (!this.currentGuide) return '';
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.handleKnowledgeBaseBackdropClick();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-4xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          
+          <!-- 顶部导航 -->
+          <div class="flex items-center justify-between mb-6">
+            <button onclick="planner.backToGuideList()"
+                    class="flex items-center gap-2 px-3 py-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+              </svg>
+              <span class="${isDark ? 'text-gray-300' : 'text-gray-600'}">返回列表</span>
+            </button>
+            <div class="flex items-center gap-2">
+              <button onclick="planner.saveGuideWithStatus()"
+                      class="px-4 py-2 bg-purple-500 hover:bg-purple-600 text-white rounded-lg transition-colors flex items-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                保存指南
+              </button>
+              <button onclick="planner.closeKnowledgeBase();"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          
+          <!-- 指南名称 -->
+          <div class="mb-6">
+            <label class="block text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-600'} mb-2">指南名称</label>
+            <input type="text" 
+                   value="${this.currentGuide.name}"
+                   onchange="planner.updateGuideName(this.value)"
+                   class="w-full px-4 py-3 text-lg font-medium rounded-xl border ${inputBg} focus:outline-none focus:ring-2 focus:ring-purple-500"
+                   placeholder="输入指南名称...">
+          </div>
+          
+          <!-- 指南步骤 -->
+          <div class="mb-6">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-lg font-semibold ${textClass}">指南步骤</h3>
+              <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${this.currentGuide.steps.length} 个步骤</span>
+            </div>
+            
+            ${this.currentGuide.steps.length === 0 ? `
+              <div class="text-center py-8 ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'} rounded-xl">
+                <div class="text-4xl mb-2">📝</div>
+                <p class="${isDark ? 'text-gray-400' : 'text-gray-500'}">还没有步骤</p>
+                <p class="text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}">点击下方按钮添加步骤</p>
+              </div>
+            ` : `
+              <div class="space-y-4" id="stepsContainer">
+                ${this.currentGuide.steps.map((step, index) => `
+                  <div class="p-4 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} rounded-xl border ${isDark ? 'border-gray-600' : 'border-gray-200'} cursor-move"
+                       draggable="true"
+                       ondragstart="planner.handleDragStart(event, '${step.id}')"
+                       ondragover="planner.handleDragOver(event)"
+                       ondrop="planner.handleDrop(event, '${step.id}')"
+                       ondragend="planner.handleDragEnd(event)"
+                       onclick="planner.setFocusedStep('${step.id}')"
+                       data-step-id="${step.id}">
+                    <!-- 步骤头部 -->
+                    <div class="flex items-center justify-between mb-3">
+                      <div class="flex items-center gap-3">
+                        <!-- 拖拽手柄 -->
+                        <div class="cursor-grab ${isDark ? 'text-gray-500' : 'text-gray-400'} hover:${isDark ? 'text-gray-300' : 'text-gray-600'}">
+                          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16"/>
+                          </svg>
+                        </div>
+                        <!-- 步骤序号 -->
+                        <span class="step-number w-8 h-8 flex items-center justify-center ${isDark ? 'bg-purple-600' : 'bg-purple-500'} text-white text-sm font-bold rounded-full">${index + 1}</span>
+                        <!-- 标题输入 -->
+                        <input type="text"
+                               value="${step.title}"
+                               onchange="planner.updateStepContent('${step.id}', 'title', this.value)"
+                               onfocus="planner.setFocusedStep('${step.id}')"
+                               class="flex-1 px-3 py-1.5 text-sm font-medium rounded-lg border ${inputBg} focus:outline-none focus:ring-2 focus:ring-purple-500"
+                               placeholder="标题">
+                      </div>
+                      <div class="flex items-center gap-1">
+                        <button onclick="planner.deleteStep('${step.id}')"
+                                class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-colors">
+                          <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                    
+                    <!-- 操作说明和图片 -->
+                    <div class="ml-11">
+                      <!-- textarea 编辑区域，支持换行（不自动保存） -->
+                      <textarea id="step-content-${step.id}"
+                                data-step-id="${step.id}"
+                                class="w-full min-h-[80px] px-3 py-2 text-sm rounded-lg border ${isDark ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-200 bg-white text-gray-800'} focus:outline-none focus:ring-2 focus:ring-purple-500 resize-y"
+                                onfocus="planner.setFocusedStep('${step.id}')"
+                                placeholder="输入操作说明...（支持换行）">${step.content || ''}</textarea>
+                      
+                      <!-- 图片显示区域 -->
+                      <div id="images-container-${step.id}" class="images-container mt-2 flex flex-wrap gap-2">
+                        ${(() => {
+                          const allImages: string[] = [];
+                          if (step.imageUrl) allImages.push(step.imageUrl);
+                          if (step.images && step.images.length > 0) {
+                            step.images.forEach(img => {
+                              if (!allImages.includes(img)) allImages.push(img);
+                            });
+                          }
+                          return allImages.map((img, idx) => `<div class="inline-block relative group"><img src="${img}" class="inline-image" data-image-id="${step.id}" data-image-index="${idx}" style="max-width:200px;max-height:150px;border-radius:8px;cursor:pointer;" onclick="event.stopPropagation();" ondblclick="event.stopPropagation(); planner.enlargeImage('${img}', '${step.id}')"><button class="absolute top-1 right-1 p-1 bg-red-500 hover:bg-red-600 text-white rounded-full transition-opacity" style="width:20px;height:20px;display:flex;align-items:center;justify-content:center;" onclick="event.stopPropagation(); planner.removeImageByIndex('${step.id}', ${idx})" title="删除图片"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg></button></div>`).join('');
+                        })()}
+                      </div>
+                      
+                      <!-- 图片操作按钮 -->
+                      <div class="mt-2 flex gap-2">
+                        <button onclick="planner.triggerImageUpload('${step.id}')"
+                                class="px-2 py-1 text-xs ${isDark ? 'bg-gray-600 hover:bg-gray-500 text-gray-200' : 'bg-gray-200 hover:bg-gray-300 text-gray-600'} rounded transition-colors flex items-center gap-1">
+                          <span>🖼️</span>
+                          <span>上传图片</span>
+                        </button>
+                        <button onclick="planner.triggerScreenshot('${step.id}')"
+                                class="px-2 py-1 text-xs ${isDark ? 'bg-gray-600 hover:bg-gray-500 text-gray-200' : 'bg-gray-200 hover:bg-gray-300 text-gray-600'} rounded transition-colors flex items-center gap-1">
+                          <span>📷</span>
+                          <span>截图(Ctrl+B)</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            `}
+          </div>
+          
+          <!-- 添加步骤按钮 -->
+          <button onclick="planner.addStepToGuide()"
+                  class="w-full p-4 border-2 border-dashed ${isDark ? 'border-gray-600 hover:border-purple-500 hover:bg-gray-700' : 'border-gray-300 hover:border-purple-400 hover:bg-purple-50'} rounded-xl transition-all flex items-center justify-center gap-2">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+            </svg>
+            <span class="${isDark ? 'text-gray-300' : 'text-gray-600'}">添加步骤</span>
+          </button>
+        </div>
+      </div>
+      ${this.generateEnlargedImageHTML()}
+    `;
+  }
+
+  // 拖拽相关
+  private draggedStepId: string = '';
+
+  public handleDragStart(event: DragEvent, stepId: string): void {
+    this.draggedStepId = stepId;
+    const target = event.target as HTMLElement;
+    target.classList.add('opacity-50');
+    event.dataTransfer!.effectAllowed = 'move';
+  }
+
+  public handleDragOver(event: DragEvent): void {
+    event.preventDefault();
+    event.dataTransfer!.dropEffect = 'move';
+  }
+
+  public handleDrop(event: DragEvent, targetStepId: string): void {
+    event.preventDefault();
+    if (!this.currentGuide || this.draggedStepId === targetStepId) return;
+    
+    // 先保存所有 textarea 的当前内容
+    this.currentGuide.steps.forEach(step => {
+      const textarea = document.getElementById(`step-content-${step.id}`) as HTMLTextAreaElement;
+      if (textarea) {
+        step.content = textarea.value;
+      }
+    });
+    
+    const draggedIndex = this.currentGuide.steps.findIndex(s => s.id === this.draggedStepId);
+    const targetIndex = this.currentGuide.steps.findIndex(s => s.id === targetStepId);
+    
+    if (draggedIndex === -1 || targetIndex === -1) return;
+    
+    // 移动步骤
+    const [draggedStep] = this.currentGuide.steps.splice(draggedIndex, 1);
+    this.currentGuide.steps.splice(targetIndex, 0, draggedStep);
+    
+    // 更新排序
+    this.currentGuide.steps.forEach((s, i) => s.order = i);
+    this.saveCurrentGuide();
+    this.render();
+  }
+
+  public handleDragEnd(event: DragEvent): void {
+    const target = event.target as HTMLElement;
+    target.classList.remove('opacity-50');
+    this.draggedStepId = '';
+  }
+
+  // 触发图片上传
+  public triggerImageUpload(stepId: string): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const base64 = event.target?.result as string;
+          this.updateStepImage(stepId, base64);
+        };
+        reader.readAsDataURL(file);
+      }
+    };
+    input.click();
+  }
+
+  // 更新步骤图片（添加到图片数组）
+  private async updateStepImage(stepId: string, imageUrl: string): Promise<void> {
+    if (!this.currentGuide) return;
+    
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (!step) return;
+    
+    // 先压缩图片
+    const compressedImage = await this.compressImage(imageUrl);
+    
+    // 添加到图片数组
+    if (!step.images) {
+      step.images = [];
+    }
+    step.images.push(compressedImage);
+    
+    // 兼容旧数据：如果有旧的 imageUrl，迁移到 images 数组
+    if (step.imageUrl && !step.images.includes(step.imageUrl)) {
+      step.images.unshift(step.imageUrl);
+      step.imageUrl = undefined;
+    }
+    
+    // 更新图片显示区域
+    const imagesContainer = document.getElementById(`images-container-${stepId}`);
+    if (imagesContainer) {
+      const imgIndex = step.images.length - 1;
+      const imgWrapper = document.createElement('div');
+      imgWrapper.className = 'image-wrapper inline-block relative group';
+      imgWrapper.innerHTML = `
+        <img src="${compressedImage}" class="inline-image" data-image-id="${stepId}" data-image-index="${imgIndex}" style="max-width:200px;max-height:150px;border-radius:8px;cursor:pointer;" onclick="event.stopPropagation();" ondblclick="event.stopPropagation(); planner.enlargeImage('${compressedImage}', '${stepId}')">
+        <button class="absolute top-1 right-1 p-1 bg-red-500 hover:bg-red-600 text-white rounded-full opacity-0 transition-opacity image-delete-btn" style="width:20px;height:20px;display:flex;align-items:center;justify-content:center;" onclick="event.stopPropagation(); planner.removeImageByIndex('${stepId}', ${imgIndex})" title="删除图片">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      `;
+      imagesContainer.appendChild(imgWrapper);
+    }
+    
+    this.saveCurrentGuide();
+    console.log('图片已添加到步骤:', stepId, '当前图片数:', step.images.length);
+  }
+  
+  // 压缩图片
+  private compressImage(base64: string): Promise<string> {
+    return new Promise((resolve) => {
+      // 如果不是 base64 图片，直接返回
+      if (!base64.startsWith('data:image')) {
+        resolve(base64);
+        return;
+      }
+      
+      const img = new Image();
+      img.onload = () => {
+        // 计算压缩后的尺寸
+        let width = img.width;
+        let height = img.height;
+        
+        // 如果图片尺寸超过限制，按比例缩放
+        if (width > IMAGE_COMPRESSION_CONFIG.maxWidth || height > IMAGE_COMPRESSION_CONFIG.maxHeight) {
+          const ratio = Math.min(
+            IMAGE_COMPRESSION_CONFIG.maxWidth / width,
+            IMAGE_COMPRESSION_CONFIG.maxHeight / height
+          );
+          width = Math.round(width * ratio);
+          height = Math.round(height * ratio);
+        }
+        
+        // 创建 canvas 进行压缩
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        
+        if (!ctx) {
+          resolve(base64);
+          return;
+        }
+        
+        // 绘制图片
+        ctx.drawImage(img, 0, 0, width, height);
+        
+        // 转换为压缩后的 base64
+        const compressedBase64 = canvas.toDataURL(
+          IMAGE_COMPRESSION_CONFIG.mimeType,
+          IMAGE_COMPRESSION_CONFIG.quality
+        );
+        
+        // 计算压缩比
+        const originalSize = Math.round(base64.length / 1024);
+        const compressedSize = Math.round(compressedBase64.length / 1024);
+        const ratio_percent = Math.round((1 - compressedSize / originalSize) * 100);
+        console.log(`[图片压缩] ${originalSize}KB -> ${compressedSize}KB (压缩 ${ratio_percent}%)`);
+        
+        resolve(compressedBase64);
+      };
+      
+      img.onerror = () => {
+        console.error('[图片压缩] 加载图片失败');
+        resolve(base64);
+      };
+      
+      img.src = base64;
+    });
+  }
+  
+  // 保存当前编辑区域中的值（从 textarea 读取）
+  private saveCurrentTextareaValue(stepId: string): void {
+    const textarea = document.getElementById(`step-content-${stepId}`) as HTMLTextAreaElement;
+    if (!textarea || !this.currentGuide) return;
+    
+    const step = this.currentGuide.steps.find(s => s.id === stepId);
+    if (step) {
+      step.content = textarea.value;
+    }
+  }
+
+  // 移除步骤图片
+  public removeStepImage(stepId: string): void {
+    this.removeStepImageFromEditor(stepId);
+  }
+
+  // 触发截图（监听粘贴事件）
+  public triggerScreenshot(stepId: string): void {
+    // 设置当前步骤ID，截图完成后保存到此步骤
+    this.screenshotStepId = stepId;
+    
+    // 直接启动截图功能
+    this.startRealScreenshot();
+  }
+
+  // 截图步骤ID（临时存储）
+  private screenshotStepId: string = '';
+  
+  // 当前聚焦的步骤ID（用于粘贴图片）
+  private focusedStepId: string = '';
+  
+  // 图片放大弹窗
+  private enlargedImageUrl: string = '';
+  private enlargedImageStepId: string = '';  // 放大图片对应的步骤ID
+  private enlargedImageScale: number = 1;
+  
+  // 保存状态提示
+  private saveStatus: string = '';  // 'saving' | 'saved' | ''
+  
+  // 铃铛通知相关
+  private showNotificationPanel: boolean = false;  // 显示通知面板
+  private readNotificationIds: Set<string> = new Set();  // 已读通知ID
+  private clearedNotificationIds: Set<string> = new Set();  // 已清除通知ID（不在列表显示）
+  
+  // 获取未读通知列表
+  private getUnreadNotifications(): NotificationItem[] {
+    const notifications: NotificationItem[] = [];
+    const today = new Date();
+    const todayStr = this.formatDate(today);
+    
+    // 遍历所有任务，找出未完成的、即将到期的任务
+    Object.keys(this.tasks).forEach(dateKey => {
+      const tasks = this.tasks[dateKey];
+      tasks.forEach(task => {
+        if (!task.completed) {
+          // 计算距离今天的天数
+          const taskDate = parseLocalDate(dateKey);
+          const diffDays = Math.round((taskDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+          
+          // 显示：逾期未完成任务 + 未来7天内到期的任务
+          if (diffDays <= 7) {
+            notifications.push({
+              id: `${task.id}-${dateKey}`,
+              date: dateKey,
+              taskText: task.text,
+              taskId: task.id,
+              dateKey: dateKey,
+              diffDays: diffDays  // 添加天数差，用于排序
+            });
+          }
+        }
+      });
+    });
+    
+    // 按日期排序（按 diffDays 排序，负数排前面表示过期日期在前）
+    notifications.sort((a, b) => (a.diffDays || 0) - (b.diffDays || 0));
+    
+    // 过滤掉已清除的通知
+    return notifications.filter(n => !this.clearedNotificationIds.has(n.id));
+  }
+  
+  // 获取未读通知数量
+  private getUnreadCount(): number {
+    const notifications = this.getUnreadNotifications();
+    return notifications.filter(n => !this.readNotificationIds.has(n.id)).length;
+  }
+  
+  // 标记通知为已读
+  public markNotificationRead(notificationId: string): void {
+    this.readNotificationIds.add(notificationId);
+    this.saveNotificationState();
+  }
+  
+  // 标记所有通知为已读
+  public markAllNotificationsRead(): void {
+    const notifications = this.getUnreadNotifications();
+    notifications.forEach(n => this.readNotificationIds.add(n.id));
+    this.saveNotificationState();
+    this.render();
+  }
+  
+  // 保存通知状态
+  private saveNotificationState(): void {
+    localStorage.setItem('dailyPlanner_readNotifications', JSON.stringify([...this.readNotificationIds]));
+    localStorage.setItem('dailyPlanner_clearedNotifications', JSON.stringify([...this.clearedNotificationIds]));
+  }
+  
+  // 加载通知状态
+  private loadNotificationState(): void {
+    const saved = localStorage.getItem('dailyPlanner_readNotifications');
+    if (saved) {
+      try {
+        this.readNotificationIds = new Set(JSON.parse(saved));
+      } catch {
+        this.readNotificationIds = new Set();
+      }
+    }
+    
+    const cleared = localStorage.getItem('dailyPlanner_clearedNotifications');
+    if (cleared) {
+      try {
+        this.clearedNotificationIds = new Set(JSON.parse(cleared));
+      } catch {
+        this.clearedNotificationIds = new Set();
+      }
+    }
+  }
+  
+  // 切换通知面板显示
+  public toggleNotificationPanel(): void {
+    this.showNotificationPanel = !this.showNotificationPanel;
+    if (this.showNotificationPanel) {
+      this.showThemeMenu = false;
+      this.showMoreMenu = false;
+    }
+    this.render();
+  }
+  
+  // 从通知跳转到任务
+  public jumpToTaskFromNotification(dateKey: string, taskId: string, notificationId: string): void {
+    // 标记为已读
+    this.markNotificationRead(notificationId);
+    
+    // 关闭通知面板
+    this.showNotificationPanel = false;
+    
+    // 设置选中日期
+    this.selectedDate = parseLocalDate(dateKey);
+    this.showTaskPanel = true;
+    
+    this.render();
+    
+    // 延迟滚动到任务
+    setTimeout(() => {
+      // 只在任务面板中查找任务元素
+      const taskPanel = document.querySelector('.task-panel');
+      const taskElement = taskPanel ? taskPanel.querySelector(`[data-task-id="${taskId}"]`) : null;
+      if (taskElement) {
+        taskElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        taskElement.classList.add('ring-2', 'ring-blue-500');
+        setTimeout(() => {
+          taskElement.classList.remove('ring-2', 'ring-blue-500');
+        }, 2000);
+      }
+    }, 300);
+  }
+
+  // 处理粘贴图片
+  public handlePaste(event: ClipboardEvent): void {
+    if (!this.screenshotStepId) return;
+    
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile();
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const base64 = e.target?.result as string;
+            this.updateStepImage(this.screenshotStepId, base64);
+            this.screenshotStepId = '';
+          };
+          reader.readAsDataURL(file);
+        }
+        break;
+      }
+    }
+  }
+
+  // 生成周总结弹窗 HTML
+  private generateWeeklySummaryHTML(): string {
+    if (!this.showWeeklySummary) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const stats = this.getWeeklyStats(this.viewingWeekOffset);
+    
+    const circumference = 2 * Math.PI * 60;
+    const offset = circumference - (stats.percentage / 100) * circumference;
+    
+    // 计算每日最大任务数用于柱状图
+    const maxDailyTasks = Math.max(...stats.byDay.map(d => d.total), 1);
+    
+    // 激励文案
+    const getMotivationText = () => {
+      if (stats.percentage >= 90) return { text: '🎉 本周表现卓越！你是个效率达人！', emoji: '🏆' };
+      if (stats.percentage >= 70) return { text: '👏 本周表现优秀！继续保持！', emoji: '💪' };
+      if (stats.percentage >= 50) return { text: '💪 本周表现良好，还有提升空间！', emoji: '📈' };
+      return { text: '🚀 下周加油！相信你可以做得更好！', emoji: '⭐' };
+    };
+    const motivation = getMotivationText();
+    
+    // 获取当前查看周的信息
+    const weekInfo = this.getWeekDateRange(this.viewingWeekOffset);
+    const weekTitle = this.viewingWeekOffset === 0 ? '本周总结' : 
+                      this.viewingWeekOffset === -1 ? '上周总结' : 
+                      this.viewingWeekOffset === 1 ? '下周总结' : 
+                      `第${weekInfo.weekNum}周总结`;
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showWeeklySummary = false; planner.viewingWeekOffset = 0; planner.render();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          
+          <!-- 标题与导航 -->
+          <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center gap-2">
+              <!-- 左箭头 -->
+              <button onclick="planner.navigateWeeklySummary(-1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                </svg>
+              </button>
+              <div class="text-center min-w-[120px]">
+                <h2 class="text-xl font-bold ${textClass} flex items-center gap-2">
+                  <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                  </svg>
+                  ${weekTitle}
+                </h2>
+                <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${stats.byDay[0].date} ~ ${stats.byDay[6].date}</p>
+              </div>
+              <!-- 右箭头 -->
+              <button onclick="planner.navigateWeeklySummary(1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+              </button>
+            </div>
+            <button onclick="planner.showWeeklySummary = false; planner.viewingWeekOffset = 0; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          
+          <!-- 周期选择器 -->
+          <div class="flex items-center gap-2 mb-4 p-2 ${isDark ? 'bg-gray-700' : 'bg-gray-100'} rounded-lg">
+            <label class="text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}">跳转到:</label>
+            <select id="weekYearSelect" onchange="planner.jumpToWeekFromSelect()"
+                    class="flex-1 px-2 py-1 text-sm rounded border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}">
+              ${this.generateYearOptions(weekInfo.year)}
+            </select>
+            <select id="weekNumSelect" onchange="planner.jumpToWeekFromSelect()"
+                    class="flex-1 px-2 py-1 text-sm rounded border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}">
+              ${this.generateWeekOptions(weekInfo.weekNum)}
+            </select>
+          </div>
+          
+          <!-- 核心数据区 -->
+          <div class="flex items-center gap-6 mb-6">
+            <!-- 环形进度条 -->
+            <div class="relative flex-shrink-0">
+              <svg width="140" height="140" class="transform -rotate-90">
+                <circle cx="70" cy="70" r="60" stroke="${isDark ? '#374151' : '#e5e7eb'}" stroke-width="10" fill="none"/>
+                <circle cx="70" cy="70" r="60" stroke="url(#gradient)" stroke-width="10" fill="none"
+                        stroke-linecap="round" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                        class="transition-all duration-700 ease-in-out"/>
+                <defs>
+                  <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" style="stop-color:#10b981"/>
+                    <stop offset="100%" style="stop-color:#3b82f6"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div class="absolute inset-0 flex flex-col items-center justify-center">
+                <span class="text-3xl font-bold ${textClass}">${stats.percentage}%</span>
+                <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">完成率</span>
+              </div>
+            </div>
+            
+            <!-- 统计卡片 -->
+            <div class="flex-1 grid grid-cols-2 gap-3">
+              <div class="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900/30 dark:to-blue-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-blue-600">${stats.total}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">总任务</div>
+              </div>
+              <div class="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900/30 dark:to-green-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-green-600">${stats.completed}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">已完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900/30 dark:to-orange-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-orange-600">${stats.pending}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">未完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900/30 dark:to-purple-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-purple-600">${stats.streakDays}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">连续打卡</div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 每日趋势柱状图 -->
+          <div class="mb-6">
+            <h3 class="text-sm font-semibold ${textClass} mb-3">📅 每日完成趋势</h3>
+            <div class="flex items-end justify-between gap-2 h-24 px-2">
+              ${stats.byDay.map(day => {
+                const height = day.total > 0 ? Math.max((day.completed / maxDailyTasks) * 100, 8) : 8;
+                const isToday = day.date === this.formatDate(new Date());
+                return `
+                  <div class="flex flex-col items-center flex-1">
+                    <div class="w-full flex flex-col items-center justify-end h-20">
+                      <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} mb-1">${day.completed}/${day.total}</div>
+                      <div class="w-full max-w-[30px] rounded-t-md transition-all duration-300 ${isToday ? 'bg-gradient-to-t from-blue-500 to-blue-400' : 'bg-gradient-to-t from-green-500 to-green-400'}"
+                           style="height: ${height}%"></div>
+                    </div>
+                    <span class="text-xs mt-1 ${isToday ? 'font-bold text-blue-500' : isDark ? 'text-gray-400' : 'text-gray-500'}">${day.dayName}</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+          
+          <!-- 对比上周 -->
+          <div class="mb-4 p-3 rounded-xl ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'}">
+            <div class="flex items-center justify-between">
+              <span class="text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}">📈 较上周对比</span>
+              <span class="font-bold ${stats.improvement >= 0 ? 'text-green-500' : 'text-red-500'}">
+                ${stats.improvement >= 0 ? '+' : ''}${stats.improvement}%
+              </span>
+            </div>
+            <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} mt-1">
+              上周完成率: ${stats.lastWeekPercentage}%
+            </div>
+          </div>
+          
+          <!-- 激励文案 -->
+          <div class="p-4 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 text-white text-center">
+            <div class="text-2xl mb-1">${motivation.emoji}</div>
+            <div class="font-medium">${motivation.text}</div>
+          </div>
+          
+          <!-- 周总结文字区域 -->
+          <div class="mt-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-sm font-semibold ${textClass} flex items-center gap-1">
+                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+                ${this.viewingWeekOffset === 0 ? '本周' : '该周'}感想
+              </h3>
+              <button onclick="const textarea = document.getElementById('weekly-note-textarea'); planner.saveWeeklySummaryNoteWithStatus(textarea.value);"
+                      class="px-3 py-1 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                保存
+              </button>
+            </div>
+            <textarea 
+              id="weekly-note-textarea"
+              class="w-full h-24 p-3 rounded-xl border ${isDark ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400'} focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+              placeholder="写下这周的总结感想..."
+            >${this.summaryNotes.weekly[this.getWeekKey(this.viewingWeekOffset)] || ''}</textarea>
+          </div>
+          
+          <!-- 成就徽章 -->
+          ${stats.streakDays >= 7 ? `
+            <div class="mt-4 flex items-center justify-center gap-2">
+              <span class="px-3 py-1 bg-yellow-100 text-yellow-700 rounded-full text-sm font-medium">🔥 坚持一周</span>
+            </div>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成月总结弹窗 HTML
+  private generateMonthlySummaryHTML(): string {
+    if (!this.showMonthlySummary) return '';
+    
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    
+    // 使用偏移量计算年份和月份
+    const monthInfo = this.getMonthInfo(this.viewingMonthOffset);
+    const year = monthInfo.year;
+    const month = monthInfo.month - 1; // 转换为0-based
+    const monthNames = ['一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月'];
+    
+    // 统计本月数据
+    let total = 0;
+    let completed = 0;
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const dailyData: { day: number; total: number; completed: number }[] = [];
+    
+    for (let day = 1; day <= lastDay; day++) {
+      const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dayTasks = this.tasks[dateKey] || [];
+      const dayTotal = dayTasks.length;
+      const dayCompleted = dayTasks.filter(t => t.completed).length;
+      
+      dailyData.push({ day, total: dayTotal, completed: dayCompleted });
+      total += dayTotal;
+      completed += dayCompleted;
+    }
+    
+    const pending = total - completed;
+    const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+    
+    // 计算上月数据
+    const lastMonth = month === 0 ? 11 : month - 1;
+    const lastMonthYear = month === 0 ? year - 1 : year;
+    let lastMonthTotal = 0;
+    let lastMonthCompleted = 0;
+    const lastMonthLastDay = new Date(lastMonthYear, lastMonth + 1, 0).getDate();
+    
+    for (let day = 1; day <= lastMonthLastDay; day++) {
+      const dateKey = `${lastMonthYear}-${String(lastMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dayTasks = this.tasks[dateKey] || [];
+      lastMonthTotal += dayTasks.length;
+      lastMonthCompleted += dayTasks.filter(t => t.completed).length;
+    }
+    
+    const lastMonthPercentage = lastMonthTotal > 0 ? Math.round((lastMonthCompleted / lastMonthTotal) * 100) : 0;
+    const improvement = percentage - lastMonthPercentage;
+    
+    const circumference = 2 * Math.PI * 60;
+    const offset = circumference - (percentage / 100) * circumference;
+    
+    // 日历热力图
+    const heatmapHTML = this.generateHeatmapHTML(year, month, dailyData, isDark);
+    
+    // 激励文案
+    const getMotivationText = () => {
+      if (percentage >= 90) return { text: '🏆 本月表现卓越！你是效率冠军！', color: 'from-yellow-400 to-orange-500' };
+      if (percentage >= 70) return { text: '👏 本月表现优秀！继续保持！', color: 'from-green-400 to-blue-500' };
+      if (percentage >= 50) return { text: '💪 本月表现良好，下月继续加油！', color: 'from-blue-400 to-purple-500' };
+      return { text: '🚀 下个月，你一定可以做得更好！', color: 'from-purple-400 to-pink-500' };
+    };
+    const motivation = getMotivationText();
+    // 月总结标题
+    const monthTitle = this.viewingMonthOffset === 0 ? '本月总结' : 
+                       this.viewingMonthOffset === -1 ? '上月总结' : 
+                       this.viewingMonthOffset === 1 ? '下月总结' : 
+                       `${monthNames[month]}总结`;
+    
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showMonthlySummary = false; planner.viewingMonthOffset = 0; planner.render();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          
+          <!-- 标题与导航 -->
+          <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center gap-2">
+              <!-- 左箭头 -->
+              <button onclick="planner.navigateMonthlySummary(-1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                </svg>
+              </button>
+              <div class="text-center min-w-[120px]">
+                <h2 class="text-xl font-bold ${textClass} flex items-center gap-2">
+                  <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                  </svg>
+                  ${monthTitle}
+                </h2>
+                <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${year}年</p>
+              </div>
+              <!-- 右箭头 -->
+              <button onclick="planner.navigateMonthlySummary(1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+              </button>
+            </div>
+            <button onclick="planner.showMonthlySummary = false; planner.viewingMonthOffset = 0; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          
+          <!-- 月份选择器 -->
+          <div class="flex items-center gap-2 mb-4 p-2 ${isDark ? 'bg-gray-700' : 'bg-gray-100'} rounded-lg">
+            <label class="text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}">跳转到:</label>
+            <select id="monthYearSelect" onchange="planner.jumpToMonthFromSelect()"
+                    class="flex-1 px-2 py-1 text-sm rounded border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}">
+              ${this.generateYearOptions(year)}
+            </select>
+            <select id="monthNumSelect" onchange="planner.jumpToMonthFromSelect()"
+                    class="flex-1 px-2 py-1 text-sm rounded border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}">
+              ${this.generateMonthOptions(monthInfo.month)}
+            </select>
+          </div>
+          
+          <!-- 核心数据区 -->
+          <div class="flex items-center gap-6 mb-6">
+            <!-- 环形进度条 -->
+            <div class="relative flex-shrink-0">
+              <svg width="140" height="140" class="transform -rotate-90">
+                <circle cx="70" cy="70" r="60" stroke="${isDark ? '#374151' : '#e5e7eb'}" stroke-width="10" fill="none"/>
+                <circle cx="70" cy="70" r="60" stroke="url(#gradientMonth)" stroke-width="10" fill="none"
+                        stroke-linecap="round" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                        class="transition-all duration-700 ease-in-out"/>
+                <defs>
+                  <linearGradient id="gradientMonth" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" style="stop-color:#8b5cf6"/>
+                    <stop offset="100%" style="stop-color:#3b82f6"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div class="absolute inset-0 flex flex-col items-center justify-center">
+                <span class="text-3xl font-bold ${textClass}">${percentage}%</span>
+                <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">完成率</span>
+              </div>
+            </div>
+            
+            <!-- 统计卡片 -->
+            <div class="flex-1 grid grid-cols-2 gap-3">
+              <div class="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900/30 dark:to-blue-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-blue-600">${total}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">总任务</div>
+              </div>
+              <div class="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900/30 dark:to-green-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-green-600">${completed}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">已完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900/30 dark:to-orange-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-orange-600">${pending}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">未完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900/30 dark:to-purple-800/30 rounded-xl p-3 text-center">
+                <div class="text-2xl font-bold text-purple-600">${Math.round(total / lastDay * 10) / 10}</div>
+                <div class="text-xs text-gray-600 dark:text-gray-400">日均任务</div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 日历热力图 -->
+          <div class="mb-6">
+            <h3 class="text-sm font-semibold ${textClass} mb-3">📅 任务日历</h3>
+            ${heatmapHTML}
+          </div>
+          
+          <!-- 对比上月 -->
+          <div class="mb-4 p-3 rounded-xl ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'}">
+            <div class="flex items-center justify-between">
+              <span class="text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}">📈 较上月对比</span>
+              <span class="font-bold ${improvement >= 0 ? 'text-green-500' : 'text-red-500'}">
+                ${improvement >= 0 ? '+' : ''}${improvement}%
+              </span>
+            </div>
+            <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} mt-1">
+              上月完成率: ${lastMonthPercentage}%
+            </div>
+          </div>
+          
+          <!-- 激励文案 -->
+          <div class="p-4 rounded-xl bg-gradient-to-r ${motivation.color} text-white text-center">
+            <div class="font-medium">${motivation.text}</div>
+          </div>
+          
+          <!-- 月总结文字区域 -->
+          <div class="mt-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-sm font-semibold ${textClass} flex items-center gap-1">
+                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+                ${this.viewingMonthOffset === 0 ? '本月' : '该月'}感想
+              </h3>
+              <button onclick="const textarea = document.getElementById('monthly-note-textarea'); planner.saveMonthlySummaryNoteWithStatus(textarea.value);"
+                      class="px-3 py-1 text-xs bg-purple-500 hover:bg-purple-600 text-white rounded-lg transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                保存
+              </button>
+            </div>
+            <textarea 
+              id="monthly-note-textarea"
+              class="w-full h-24 p-3 rounded-xl border ${isDark ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400'} focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none"
+              placeholder="写下这个月的总结感想..."
+            >${this.summaryNotes.monthly[this.getMonthKey(this.viewingMonthOffset)] || ''}</textarea>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成日历热力图
+  private generateHeatmapHTML(year: number, month: number, dailyData: { day: number; total: number; completed: number }[], isDark: boolean): string {
+    const firstDay = new Date(year, month, 1).getDay();
+    const adjustedFirstDay = firstDay === 0 ? 6 : firstDay - 1; // 周一为第一天
+    
+    const weekDays = ['一', '二', '三', '四', '五', '六', '日'];
+    
+    let html = `
+      <div class="grid grid-cols-7 gap-1 text-center mb-1">
+        ${weekDays.map(d => `<div class="text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}">${d}</div>`).join('')}
+      </div>
+      <div class="grid grid-cols-7 gap-1">
+    `;
+    
+    // 填充空白格
+    for (let i = 0; i < adjustedFirstDay; i++) {
+      html += `<div class="aspect-square"></div>`;
+    }
+    
+    // 填充日期
+    dailyData.forEach(({ day, total, completed }) => {
+      let bgColor = isDark ? 'bg-gray-700' : 'bg-gray-100';
+      if (total > 0) {
+        const rate = completed / total;
+        if (rate === 1) bgColor = 'bg-green-500';
+        else if (rate >= 0.7) bgColor = 'bg-green-400';
+        else if (rate >= 0.5) bgColor = 'bg-yellow-400';
+        else if (rate > 0) bgColor = 'bg-orange-400';
+      }
+      
+      const today = new Date();
+      const isToday = day === today.getDate() && month === today.getMonth() && year === today.getFullYear();
+      
+      html += `
+        <div class="aspect-square rounded-sm ${bgColor} ${isToday ? 'ring-2 ring-blue-500' : ''} flex items-center justify-center text-xs ${total > 0 ? 'text-white' : isDark ? 'text-gray-500' : 'text-gray-400'}"
+             title="${day}日: ${completed}/${total} 完成">
+          ${day}
+        </div>
+      `;
+    });
+    
+    html += `</div>`;
+    
+    // 图例
+    html += `
+      <div class="flex items-center justify-end gap-2 mt-2 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">
+        <span>少</span>
+        <div class="flex gap-1">
+          <div class="w-3 h-3 rounded-sm ${isDark ? 'bg-gray-700' : 'bg-gray-200'}"></div>
+          <div class="w-3 h-3 rounded-sm bg-orange-400"></div>
+          <div class="w-3 h-3 rounded-sm bg-yellow-400"></div>
+          <div class="w-3 h-3 rounded-sm bg-green-400"></div>
+          <div class="w-3 h-3 rounded-sm bg-green-500"></div>
+        </div>
+        <span>多</span>
+      </div>
+    `;
+    
+    return html;
+  }
+
+  // 生成年度统计弹窗 HTML
+  private generateYearlyStatsHTML(): string {
+    if (!this.showYearlyStats) return '';
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const stats = this.getYearlyStatsExtended(this.viewingYearOffset);
+    const currentYear = this.currentDate.getFullYear() + this.viewingYearOffset;
+
+    const monthNames = ['一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月'];
+    
+    const circumference = 2 * Math.PI * 70;
+    const offset = circumference - (stats.percentage / 100) * circumference;
+    
+    // 计算每月最大任务数用于柱状图
+    const maxMonthlyTasks = Math.max(...stats.byMonth.map(m => m.total), 1);
+    
+    // 激励文案
+    const getMotivationText = () => {
+      if (stats.percentage >= 80) return { text: `🏆 ${currentYear}年，你完成了${stats.completed}个任务，效率爆表！`, badges: ['效率达人', '任务终结者'] };
+      if (stats.percentage >= 60) return { text: `👏 ${currentYear}年，你完成了${stats.completed}个任务，表现出色！`, badges: ['坚持之星'] };
+      if (stats.percentage >= 40) return { text: `💪 ${currentYear}年，你完成了${stats.completed}个任务，继续加油！`, badges: ['努力向前'] };
+      return { text: `🚀 ${currentYear}年过去了，新的一年你一定可以做得更好！`, badges: ['新起点'] };
+    };
+    const motivation = getMotivationText();
+    
+    // 年度标题
+    const yearTitle = this.viewingYearOffset === 0 ? '本年度总结' : 
+                      this.viewingYearOffset === -1 ? '去年总结' : 
+                      this.viewingYearOffset === 1 ? '明年总结' : 
+                      `${currentYear}年度总结`;
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showYearlyStats = false; planner.viewingYearOffset = 0; planner.render();">
+        <div class="${bgClass} rounded-2xl shadow-2xl p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          
+          <!-- 标题与导航 -->
+          <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center gap-2">
+              <!-- 左箭头 -->
+              <button onclick="planner.navigateYearlySummary(-1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                </svg>
+              </button>
+              <div class="text-center min-w-[150px]">
+                <h2 class="text-2xl font-bold ${textClass} flex items-center gap-2">
+                  <svg class="w-6 h-6 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/>
+                  </svg>
+                  ${yearTitle}
+                </h2>
+                <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${currentYear}年</p>
+              </div>
+              <!-- 右箭头 -->
+              <button onclick="planner.navigateYearlySummary(1)"
+                      class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : 'text-gray-600'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+              </button>
+            </div>
+            <button onclick="planner.showYearlyStats = false; planner.viewingYearOffset = 0; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          
+          <!-- 年份选择器 -->
+          <div class="flex items-center gap-2 mb-4 p-2 ${isDark ? 'bg-gray-700' : 'bg-gray-100'} rounded-lg">
+            <label class="text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}">跳转到:</label>
+            <select id="yearSelect" onchange="planner.jumpToYearFromSelect()"
+                    class="flex-1 px-2 py-1 text-sm rounded border ${isDark ? 'bg-gray-600 border-gray-500 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}">
+              ${this.generateYearOptions(currentYear)}
+            </select>
+          </div>
+
+          <!-- 核心数据区 -->
+          <div class="flex items-center gap-6 mb-6">
+            <!-- 环形进度条 -->
+            <div class="relative flex-shrink-0">
+              <svg width="160" height="160" class="transform -rotate-90">
+                <circle cx="80" cy="80" r="70" stroke="${isDark ? '#374151' : '#e5e7eb'}" stroke-width="12" fill="none"/>
+                <circle cx="80" cy="80" r="70" stroke="url(#gradientYear)" stroke-width="12" fill="none"
+                        stroke-linecap="round" stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                        class="transition-all duration-1000 ease-in-out"/>
+                <defs>
+                  <linearGradient id="gradientYear" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" style="stop-color:#f59e0b"/>
+                    <stop offset="50%" style="stop-color:#8b5cf6"/>
+                    <stop offset="100%" style="stop-color:#3b82f6"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div class="absolute inset-0 flex flex-col items-center justify-center">
+                <span class="text-4xl font-bold ${textClass}">${stats.percentage}%</span>
+                <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">年度完成率</span>
+              </div>
+            </div>
+            
+            <!-- 统计卡片 -->
+            <div class="flex-1 grid grid-cols-2 gap-3">
+              <div class="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900/30 dark:to-blue-800/30 rounded-xl p-4 text-center">
+                <div class="text-3xl font-bold text-blue-600">${stats.total.toLocaleString()}</div>
+                <div class="text-sm text-gray-600 dark:text-gray-400">总任务数</div>
+              </div>
+              <div class="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900/30 dark:to-green-800/30 rounded-xl p-4 text-center">
+                <div class="text-3xl font-bold text-green-600">${stats.completed.toLocaleString()}</div>
+                <div class="text-sm text-gray-600 dark:text-gray-400">已完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900/30 dark:to-orange-800/30 rounded-xl p-4 text-center">
+                <div class="text-3xl font-bold text-orange-600">${stats.pending.toLocaleString()}</div>
+                <div class="text-sm text-gray-600 dark:text-gray-400">未完成</div>
+              </div>
+              <div class="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900/30 dark:to-purple-800/30 rounded-xl p-4 text-center">
+                <div class="text-3xl font-bold text-purple-600">${stats.avgDailyTasks}</div>
+                <div class="text-sm text-gray-600 dark:text-gray-400">日均任务</div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 亮点数据 -->
+          <div class="grid grid-cols-3 gap-3 mb-6">
+            <div class="p-3 rounded-xl ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'} text-center">
+              <div class="text-lg font-bold text-red-500">${stats.busiestMonth ? monthNames[stats.busiestMonth.month - 1] : '-'}</div>
+              <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">最忙碌月份 ${stats.busiestMonth ? `(${stats.busiestMonth.count}任务)` : ''}</div>
+            </div>
+            <div class="p-3 rounded-xl ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'} text-center">
+              <div class="text-lg font-bold text-green-500">${stats.mostProductiveMonth ? monthNames[stats.mostProductiveMonth.month - 1] : '-'}</div>
+              <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">最高效月份 ${stats.mostProductiveMonth ? `(${stats.mostProductiveMonth.rate}%)` : ''}</div>
+            </div>
+            <div class="p-3 rounded-xl ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'} text-center">
+              <div class="text-lg font-bold text-yellow-500">${stats.longestStreak}天</div>
+              <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">最长连续打卡</div>
+            </div>
+          </div>
+
+          <!-- 月度趋势柱状图 -->
+          <div class="mb-6">
+            <h3 class="text-sm font-semibold ${textClass} mb-3">📊 月度任务趋势</h3>
+            <div class="flex items-end justify-between gap-2 h-32 px-2">
+              ${stats.byMonth.map(m => {
+                const height = m.total > 0 ? Math.max((m.total / maxMonthlyTasks) * 100, 5) : 5;
+                const rate = m.percentage;
+                let barColor = 'from-gray-400 to-gray-500';
+                if (rate >= 80) barColor = 'from-green-400 to-green-500';
+                else if (rate >= 50) barColor = 'from-yellow-400 to-yellow-500';
+                else if (rate >= 30) barColor = 'from-orange-400 to-orange-500';
+                return `
+                  <div class="flex flex-col items-center flex-1">
+                    <div class="w-full flex flex-col items-center justify-end h-28">
+                      <div class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} mb-1">${m.total}</div>
+                      <div class="w-full max-w-[35px] rounded-t-md transition-all duration-300 bg-gradient-to-t ${barColor}"
+                           style="height: ${height}%"></div>
+                    </div>
+                    <span class="text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}">${m.month}月</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <!-- 月度详情 -->
+          <div class="mb-6">
+            <h3 class="text-sm font-semibold ${textClass} mb-3">📅 月度详情</h3>
+            <div class="space-y-2">
+              ${stats.byMonth.map(m => `
+                <div class="flex items-center gap-3">
+                  <span class="w-12 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">${monthNames[m.month - 1]}</span>
+                  <div class="flex-1 h-5 ${isDark ? 'bg-gray-700' : 'bg-gray-200'} rounded-full overflow-hidden">
+                    <div class="h-full bg-gradient-to-r from-green-400 to-green-500 rounded-full transition-all"
+                         style="width: ${m.percentage}%"></div>
+                  </div>
+                  <span class="w-16 text-sm text-right ${isDark ? 'text-gray-300' : 'text-gray-600'}">${m.completed}/${m.total}</span>
+                  <span class="w-12 text-xs text-right ${m.percentage >= 70 ? 'text-green-500' : m.percentage >= 50 ? 'text-yellow-500' : 'text-red-500'}">${m.percentage}%</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+          
+          <!-- 激励文案 -->
+          <div class="p-4 rounded-xl bg-gradient-to-r from-yellow-400 via-orange-500 to-red-500 text-white text-center mb-4">
+            <div class="text-lg font-medium">${motivation.text}</div>
+          </div>
+          
+          <!-- 成就徽章 -->
+          <div class="flex items-center justify-center gap-2 flex-wrap">
+            ${motivation.badges.map(badge => `
+              <span class="px-3 py-1.5 bg-gradient-to-r from-yellow-100 to-yellow-200 text-yellow-800 rounded-full text-sm font-medium shadow-sm">
+                🏅 ${badge}
+              </span>
+            `).join('')}
+            ${stats.longestStreak >= 30 ? `<span class="px-3 py-1.5 bg-gradient-to-r from-orange-100 to-orange-200 text-orange-800 rounded-full text-sm font-medium shadow-sm">🔥 坚持一个月</span>` : ''}
+            ${stats.longestStreak >= 100 ? `<span class="px-3 py-1.5 bg-gradient-to-r from-red-100 to-red-200 text-red-800 rounded-full text-sm font-medium shadow-sm">💎 坚持百日</span>` : ''}
+            ${stats.total >= 1000 ? `<span class="px-3 py-1.5 bg-gradient-to-r from-purple-100 to-purple-200 text-purple-800 rounded-full text-sm font-medium shadow-sm">📊 千任务达成</span>` : ''}
+          </div>
+          
+          <!-- 年度总结文字区域 -->
+          <div class="mt-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-sm font-semibold ${textClass} flex items-center gap-1">
+                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+                ${this.viewingYearOffset === 0 ? '本年度' : '该年度'}感想
+              </h3>
+              <button onclick="const textarea = document.getElementById('yearly-note-textarea'); planner.saveYearlySummaryNoteWithStatus(textarea.value);"
+                      class="px-3 py-1 text-xs bg-orange-500 hover:bg-orange-600 text-white rounded-lg transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                保存
+              </button>
+            </div>
+            <textarea 
+              id="yearly-note-textarea"
+              class="w-full h-24 p-3 rounded-xl border ${isDark ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400'} focus:outline-none focus:ring-2 focus:ring-orange-500 resize-none"
+              placeholder="写下这一年的总结感想..."
+            >${this.summaryNotes.yearly[this.getYearKey(this.viewingYearOffset)] || ''}</textarea>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 纪念日弹窗状态
+  private showAnniversaryModal: boolean = false;
+
+  // 生成纪念日管理弹窗
+  private generateAnniversaryModalHTML(): string {
+    if (!this.showAnniversaryModal) return '';
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300';
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showAnniversaryModal = false; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-bold ${textClass}">纪念日管理</h2>
+            <button onclick="planner.showAnniversaryModal = false; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="mb-6 p-4 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} rounded-lg">
+            <div class="grid grid-cols-2 gap-3 mb-3">
+              <input type="text" id="anniversaryName" placeholder="纪念日名称"
+                     class="col-span-2 px-3 py-2 border ${inputBg} rounded-lg">
+              <input type="number" id="anniversaryMonth" placeholder="月" min="1" max="12"
+                     class="px-3 py-2 border ${inputBg} rounded-lg">
+              <input type="number" id="anniversaryDay" placeholder="日" min="1" max="31"
+                     class="px-3 py-2 border ${inputBg} rounded-lg">
+              <select id="anniversaryType" class="px-3 py-2 border ${inputBg} rounded-lg">
+                <option value="birthday">生日</option>
+                <option value="anniversary">纪念日</option>
+                <option value="custom">自定义</option>
+              </select>
+              <select id="anniversaryCalendar" class="px-3 py-2 border ${inputBg} rounded-lg">
+                <option value="solar">公历</option>
+                <option value="lunar">农历</option>
+              </select>
+            </div>
+            <button onclick="planner.handleAddAnniversary()"
+                    class="w-full px-4 py-2 bg-pink-500 text-white rounded-lg hover:bg-pink-600 transition-colors">
+              添加纪念日
+            </button>
+          </div>
+
+          <div class="space-y-2">
+            ${this.anniversaries.length > 0 ? this.anniversaries.map(a => `
+              <div class="flex items-center justify-between p-3 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} rounded-lg">
+                <div>
+                  <span class="font-medium ${textClass}">${a.name}</span>
+                  <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'} ml-2">${a.isLunar ? '农历' : ''}${a.month}月${a.day}日</span>
+                  <span class="text-xs px-2 py-0.5 rounded-full ml-2 ${a.type === 'birthday' ? 'bg-pink-100 text-pink-600' : a.type === 'anniversary' ? 'bg-purple-100 text-purple-600' : 'bg-blue-100 text-blue-600'}">${a.type === 'birthday' ? '生日' : a.type === 'anniversary' ? '纪念日' : '自定义'}</span>
+                </div>
+                <button onclick="planner.deleteAnniversary('${a.id}')"
+                        class="p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded transition-colors">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              </div>
+            `).join('') : `<p class="text-center text-gray-400 py-4">暂无纪念日</p>`}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成提醒设置弹窗
+  private generateReminderSettingsHTML(): string {
+    if (!this.showReminderSettings) return '';
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const cardBg = isDark ? 'bg-gray-700' : 'bg-gray-50';
+
+    const isElectron = !!window.electronAPI;
+
+    return `
+      <div class="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center z-50"
+           onclick="planner.showReminderSettings = false; planner.render();">
+        <div class="${bgClass} rounded-xl shadow-2xl p-6 w-full max-w-md"
+             onclick="event.stopPropagation()">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-bold ${textClass} flex items-center gap-2">
+              <svg class="w-5 h-5 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+              </svg>
+              提醒设置
+            </h2>
+            <button onclick="planner.showReminderSettings = false; planner.render();"
+                    class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+              <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+
+          ${!isElectron ? `
+            <div class="mb-4 p-4 bg-yellow-100 dark:bg-yellow-900/30 rounded-lg">
+              <p class="text-sm text-yellow-700 dark:text-yellow-300">
+                ⚠️ 提醒功能仅在桌面应用中可用，请打包成桌面应用后使用此功能。
+              </p>
+            </div>
+          ` : ''}
+
+          <div class="space-y-4">
+            <!-- 纪念日提醒 -->
+            <div class="p-4 ${cardBg} rounded-lg">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span class="text-2xl">🎉</span>
+                  <span class="font-medium ${textClass}">纪念日提醒</span>
+                </div>
+                <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">提前 ${this.reminderConfig.anniversary} 天</span>
+              </div>
+              <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">生日、纪念日等将在指定天数前提醒</p>
+            </div>
+
+            <!-- 高优先级任务 -->
+            <div class="p-4 ${cardBg} rounded-lg border-l-4 border-red-500">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span class="w-4 h-4 bg-red-500 rounded-full"></span>
+                  <span class="font-medium ${textClass}">高优先级任务</span>
+                </div>
+                <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">提前 ${this.reminderConfig.high} 天</span>
+              </div>
+              <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">未完成的高优先级任务将提前7天提醒</p>
+            </div>
+
+            <!-- 中优先级任务 -->
+            <div class="p-4 ${cardBg} rounded-lg border-l-4 border-yellow-500">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span class="w-4 h-4 bg-yellow-500 rounded-full"></span>
+                  <span class="font-medium ${textClass}">中优先级任务</span>
+                </div>
+                <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">提前 ${this.reminderConfig.medium} 天</span>
+              </div>
+              <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">未完成的中优先级任务将提前5天提醒</p>
+            </div>
+
+            <!-- 低优先级任务 -->
+            <div class="p-4 ${cardBg} rounded-lg border-l-4 border-green-500">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span class="w-4 h-4 bg-green-500 rounded-full"></span>
+                  <span class="font-medium ${textClass}">低优先级任务</span>
+                </div>
+                <span class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">提前 ${this.reminderConfig.low} 天</span>
+              </div>
+              <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}">未完成的低优先级任务将提前3天提醒</p>
+            </div>
+          </div>
+
+          ${isElectron ? `
+            <div class="mt-6 pt-4 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}">
+              <button onclick="planner.testNotification()"
+                      class="w-full px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors">
+                🔔 测试通知
+              </button>
+              <p class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'} text-center mt-2">
+                点击测试通知按钮，检查系统通知是否正常工作
+              </p>
+            </div>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成周视图
+  private generateWeekViewHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+
+    // 获取本周的日期（周一开始）
+    const weekStart = new Date(this.currentDate);
+    const dayOfWeek = weekStart.getDay();
+    // getDay(): 0=周日, 1=周一, ..., 6=周六
+    // 转换为：周一=0, 周二=1, ..., 周日=6
+    const adjustedDayOfWeek = (dayOfWeek + 6) % 7;
+    weekStart.setDate(weekStart.getDate() - adjustedDayOfWeek);
+
+    const weekDays = ['一', '二', '三', '四', '五', '六', '日'];
+    const today = new Date();
+
+    let weekDaysHTML = '';
+    for (let i = 0; i < 7; i++) {
+      const date = new Date(weekStart);
+      date.setDate(date.getDate() + i);
+      const dateKey = this.formatDate(date);
+      const isToday = date.toDateString() === today.toDateString();
+      const dayTasks = this.tasks[dateKey] || [];
+      const lunarText = this.getLunarDisplayText(date);
+      // 使用年月日数值创建日期，避免时区问题
+      const year = date.getFullYear();
+      const month = date.getMonth();
+      const day = date.getDate();
+
+      weekDaysHTML += `
+        <div class="flex-1 ${bgClass} rounded-lg shadow-lg p-3 ${isToday ? 'ring-2 ring-blue-500' : ''} min-w-[120px] cursor-pointer hover:ring-2 hover:ring-blue-300 transition-all"
+             data-date="${dateKey}"
+             onclick="planner.selectDate(new Date(${year}, ${month}, ${day}))"
+             ondragover="event.preventDefault()"
+             ondrop="planner.onDateDrop(event, new Date(${year}, ${month}, ${day}))">
+          <div class="text-center mb-2 pb-2 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}">
+            <div class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">周${weekDays[i]}</div>
+            <div class="text-xl font-bold ${textClass}">${date.getDate()}</div>
+            <div class="text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}">${lunarText}</div>
+          </div>
+          <div class="week-task-list space-y-1 max-h-48 overflow-y-auto" onclick="planner.selectDate(new Date(${year}, ${month}, ${day}))">
+            ${dayTasks.length > 0 ? [...dayTasks].sort((a, b) => {
+              // 已完成的任务放最后
+              if (a.completed !== b.completed) return a.completed ? 1 : -1;
+              // 未完成任务按优先级排序
+              const pa = getPriorityConfig(a.priority).order;
+              const pb = getPriorityConfig(b.priority).order;
+              if (pa !== pb) return pa - pb;
+              // 同优先级按时间排序
+              return (a.time || '').localeCompare(b.time || '');
+            }).map(task => {
+              const taskPriority = (task.priority || 'normal') as TaskPriority;
+              const priorityConfig = PRIORITY_CONFIG[taskPriority] || PRIORITY_CONFIG['normal'];
+              return `
+              <div class="p-2 rounded ${task.completed ? 'bg-gray-100 dark:bg-gray-700' : isDark ? 'bg-gray-700' : 'bg-gray-50'} border-l-2 ${priorityConfig.borderColor}"
+                   onclick="planner.selectDate(new Date(${year}, ${month}, ${day}))">
+                <div class="flex items-center gap-1">
+                  <input type="checkbox" ${task.completed ? 'checked' : ''} 
+                         onclick="event.stopPropagation(); planner.selectedDate = new Date(${year}, ${month}, ${day}); planner.toggleTask('${task.id}');"
+                         class="w-3 h-3 rounded cursor-pointer">
+                  <span class="text-xs ${task.completed ? 'line-through text-gray-400' : textClass} truncate">${task.text}</span>
+                </div>
+              </div>
+            `}).join('') : `<p class="text-xs text-gray-400 text-center py-1">无任务</p>`}
+          </div>
+        </div>
+      `;
+    }
+
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+
+    return `
+      <div class="${bgClass} rounded-xl shadow-lg p-4">
+        <div class="flex items-center justify-between mb-4">
+          <button onclick="planner.currentDate.setDate(planner.currentDate.getDate() - 7); planner.render();"
+                  class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+          </button>
+          <h2 class="text-lg font-bold ${textClass}">
+            ${weekStart.getMonth() + 1}月${weekStart.getDate()}日 - ${weekEnd.getMonth() + 1}月${weekEnd.getDate()}日
+          </h2>
+          <button onclick="planner.currentDate.setDate(planner.currentDate.getDate() + 7); planner.render();"
+                  class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </button>
+        </div>
+        <div class="flex gap-2 overflow-x-auto">
+          ${weekDaysHTML}
+        </div>
+      </div>
+    `;
+  }
+
+  // 生成日视图
+  private generateDayViewHTML(): string {
+    const isDark = this.themeMode === 'dark';
+    const bgClass = isDark ? 'bg-gray-800' : 'bg-white';
+    const textClass = isDark ? 'text-gray-100' : 'text-gray-800';
+    const inputBg = isDark ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-gray-300';
+
+    const date = this.currentDate;
+    const dateKey = this.formatDate(date);
+    const dayTasks = this.tasks[dateKey] || [];
+    const lunarText = this.getLunarFullText(date);
+    const holidayInfo = this.getHolidayInfo(date);
+    const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
+
+    // 检查纪念日
+    const todayAnniversaries = this.getMatchingAnniversaries(date);
+
+    return `
+      <div class="${bgClass} rounded-xl shadow-lg p-6">
+        <div class="flex items-center justify-between mb-6">
+          <button onclick="planner.currentDate.setDate(planner.currentDate.getDate() - 1); planner.render();"
+                  class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+          </button>
+          <div class="text-center">
+            <h2 class="text-2xl font-bold ${textClass}">${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 周${weekDays[date.getDay()]}</h2>
+            <p class="text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}">农历 ${lunarText} ${holidayInfo ? (holidayInfo.holiday ? `· ${holidayInfo.name}` : '· 调休上班') : ''}</p>
+          </div>
+          <button onclick="planner.currentDate.setDate(planner.currentDate.getDate() + 1); planner.render();"
+                  class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+            <svg class="w-5 h-5 ${isDark ? 'text-gray-300' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </button>
+        </div>
+
+        ${todayAnniversaries.length > 0 ? `
+          <div class="mb-4 p-3 bg-pink-100 dark:bg-pink-900/30 rounded-lg">
+            ${todayAnniversaries.map(a => `<span class="text-pink-600 dark:text-pink-400">🎉 ${a.name}</span>`).join(' ')}
+          </div>
+        ` : ''}
+
+        <div class="mb-4">
+          <div class="flex gap-2">
+            <input type="text" id="dayTaskInput" placeholder="添加新任务..."
+                   class="flex-1 px-4 py-2 border ${inputBg} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   onkeypress="if(event.key === 'Enter') planner.addDayTask()">
+            <select id="dayPrioritySelect" class="px-3 py-2 border ${inputBg} rounded-lg">
+              <option value="urgent-important">🔴紧急重要</option>
+              <option value="important">🟡重要不急</option>
+              <option value="urgent">🟠紧急不重要</option>
+              <option value="normal" selected>⚪不重要不急</option>
+            </select>
+            <button onclick="planner.addDayTask()"
+                    class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors">
+              添加
+            </button>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          ${dayTasks.length > 0 ? dayTasks.map(task => {
+            const taskPriority: TaskPriority = (task.priority || 'normal') as TaskPriority;
+            const priorityConfig = getPriorityConfig(taskPriority);
+            return `
+            <div class="flex items-center gap-3 p-3 ${isDark ? 'bg-gray-700' : 'bg-gray-50'} rounded-lg border-l-4 ${priorityConfig.borderColor}">
+              <input type="checkbox" ${task.completed ? 'checked' : ''} 
+                     onchange="planner.toggleDayTask('${task.id}')"
+                     class="w-5 h-5 rounded">
+              <span class="flex-1 ${task.completed ? 'line-through text-gray-400' : textClass}">${task.text}</span>
+              <span class="text-xs text-gray-400">${task.time}</span>
+              <button onclick="planner.deleteDayTask('${task.id}')"
+                      class="p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded transition-colors">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+          `;}).join('') : `<p class="text-center text-gray-400 py-8">暂无任务</p>`}
+        </div>
+      </div>
+    `;
+  }
+
+  // 日视图添加任务
+  private addDayTask(): void {
+    const input = document.getElementById('dayTaskInput') as HTMLInputElement;
+    const priority = document.getElementById('dayPrioritySelect') as HTMLSelectElement;
+    if (input && input.value.trim()) {
+      const dateKey = this.formatDate(this.currentDate);
+      if (!this.tasks[dateKey]) {
+        this.tasks[dateKey] = [];
+      }
+      this.tasks[dateKey].push({
+        id: Date.now().toString(),
+        text: input.value.trim(),
+        completed: false,
+        date: dateKey,
+        time: this.getCurrentTime(),
+        priority: priority.value as TaskPriority,
+        tags: []
+      });
+      this.saveTasks();
+      input.value = '';
+      this.render();
+    }
+  }
+
+  // 日视图切换任务状态
+  private toggleDayTask(taskId: string): void {
+    const dateKey = this.formatDate(this.currentDate);
+    const task = this.tasks[dateKey]?.find(t => t.id === taskId);
+    if (task) {
+      task.completed = !task.completed;
+      this.saveTasks();
+      this.render();
+    }
+  }
+
+  // 日视图删除任务
+  private deleteDayTask(taskId: string): void {
+    const dateKey = this.formatDate(this.currentDate);
+    if (this.tasks[dateKey]) {
+      this.tasks[dateKey] = this.tasks[dateKey].filter(t => t.id !== taskId);
+      this.saveTasks();
+      this.render();
+    }
+  }
+
+  // 渲染整个应用
+  private render(): void {
+    const app = document.getElementById('app');
+    if (!app) return;
+
+    const theme = backgroundThemes[this.currentTheme];
+
+    // 生成主题选项
+    const themeOptions = Object.entries(backgroundThemes).map(([key, value]) => `
+      <button onclick="planner.setTheme('${key}')"
+              class="flex items-center gap-3 px-4 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors ${this.currentTheme === key ? this.themeMode === 'dark' ? 'bg-gray-700' : 'bg-gray-100' : ''}">
+        <div class="w-6 h-6 rounded-full bg-gradient-to-br ${value.from} ${value.to}"></div>
+        <span class="${this.themeMode === 'dark' ? 'text-gray-200' : ''}">${value.name}</span>
+        ${this.currentTheme === key ? '<svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>' : ''}
+      </button>
+    `).join('');
+
+    const isDark = this.themeMode === 'dark';
+
+    // 根据深色模式选择背景颜色
+    const bgFrom = isDark ? theme.darkFrom : theme.from;
+    const bgTo = isDark ? theme.darkTo : theme.to;
+
+    // 窗口控制栏（仅在 Electron 环境中显示）
+    const windowControls = window.electronAPI ? `
+      <div class="fixed top-0 left-0 right-0 h-8 ${isDark ? 'bg-gray-900/80' : 'bg-white/80'} backdrop-blur-sm flex items-center justify-between px-2 z-[100] select-none" style="-webkit-app-region: drag;">
+        <div class="flex items-center gap-2" style="-webkit-app-region: no-drag;">
+          <img src="./icon.png" class="w-4 h-4" alt="每日规划">
+          <span class="text-xs ${isDark ? 'text-gray-400' : 'text-gray-600'}">每日规划 v${APP_VERSION}</span>
+        </div>
+        <div class="flex items-center gap-1" style="-webkit-app-region: no-drag;">
+          <button onclick="planner.toggleAlwaysOnTop()" 
+                  class="w-8 h-6 flex items-center justify-center hover:${isDark ? 'bg-gray-700' : 'bg-gray-200'} rounded transition-colors group"
+                  title="窗口置顶 (Ctrl+Shift+P)">
+            <svg class="w-3 h-3 ${this.isAlwaysOnTop ? (isDark ? 'text-blue-400' : 'text-blue-500') : (isDark ? 'text-gray-400 group-hover:text-gray-200' : 'text-gray-500 group-hover:text-gray-700')}" fill="${this.isAlwaysOnTop ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/>
+            </svg>
+          </button>
+          <button onclick="planner.minimizeToTray()" 
+                  class="w-8 h-6 flex items-center justify-center hover:${isDark ? 'bg-gray-700' : 'bg-gray-200'} rounded transition-colors group"
+                  title="最小化到托盘">
+            <svg class="w-3 h-3 ${isDark ? 'text-gray-400 group-hover:text-gray-200' : 'text-gray-500 group-hover:text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4"/>
+            </svg>
+          </button>
+          <button onclick="planner.toggleMaximize()" 
+                  class="w-8 h-6 flex items-center justify-center hover:${isDark ? 'bg-gray-700' : 'bg-gray-200'} rounded transition-colors group"
+                  title="最大化/还原">
+            <svg class="w-3 h-3 ${isDark ? 'text-gray-400 group-hover:text-gray-200' : 'text-gray-500 group-hover:text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <rect x="4" y="4" width="16" height="16" rx="2" stroke-width="2"/>
+            </svg>
+          </button>
+          <button onclick="planner.closeToTray()" 
+                  class="w-8 h-6 flex items-center justify-center hover:bg-red-500 rounded transition-colors group"
+                  title="关闭到托盘">
+            <svg class="w-3 h-3 ${isDark ? 'text-gray-400 group-hover:text-white' : 'text-gray-500 group-hover:text-white'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    ` : '';
+
+    app.innerHTML = `
+      ${windowControls}
+      <div class="min-h-screen bg-gradient-to-br ${bgFrom} ${bgTo} ${window.electronAPI ? 'pt-10' : 'py-8'} px-4 transition-colors" tabindex="0" id="main-container"
+           onclick="if(planner.showTaskPanel && !event.target.closest('.task-panel') && !event.target.closest('[data-date]')) { planner.closeTaskPanel(); }">
+        <div class="max-w-4xl mx-auto">
+          <div class="flex items-center justify-between mb-6 relative z-50 flex-wrap gap-2">
+            <h1 class="text-3xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}">${this.viewMode === 'month' ? '每日规划' : '周规划'}</h1>
+            <div class="flex items-center gap-2 flex-wrap">
+              <button onclick="event.stopPropagation(); planner.jumpToToday()"
+                      class="px-3 py-2 ${isDark ? 'bg-blue-600 hover:bg-blue-700' : 'bg-blue-500 hover:bg-blue-600'} text-white rounded-lg transition-colors shadow-md text-sm font-medium"
+                      title="跳转到今天">
+                今天
+              </button>
+              <div class="flex rounded-lg overflow-hidden shadow-md">
+                <button onclick="event.stopPropagation(); planner.setViewMode('month')"
+                        class="px-3 py-2 text-sm font-medium transition-colors ${this.viewMode === 'month' ? 'bg-blue-500 text-white' : isDark ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+                  月
+                </button>
+                <button onclick="event.stopPropagation(); planner.setViewMode('week')"
+                        class="px-3 py-2 text-sm font-medium transition-colors border-l ${isDark ? 'border-gray-600' : 'border-gray-200'} ${this.viewMode === 'week' ? 'bg-blue-500 text-white' : isDark ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+                  周
+                </button>
+              </div>
+              <button onclick="event.stopPropagation(); planner.showSearchPanel = true; planner.render();"
+                      class="p-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-white hover:bg-gray-100'} rounded-lg transition-colors shadow-md"
+                      title="搜索任务">
+                <svg class="w-5 h-5 ${isDark ? 'text-gray-200' : 'text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                </svg>
+              </button>
+              <div class="relative">
+                <button onclick="event.stopPropagation(); planner.toggleThemeMenu()"
+                        class="p-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-white hover:bg-gray-100'} rounded-lg transition-colors shadow-md"
+                        title="主题设置">
+                  <svg class="w-5 h-5 ${isDark ? 'text-gray-200' : 'text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01"/>
+                  </svg>
+                </button>
+                ${this.showThemeMenu ? `
+                  <div class="fixed inset-0 z-40" onclick="planner.showThemeMenu = false; planner.render();"></div>
+                  <div class="absolute right-0 top-full mt-2 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-100'} rounded-lg shadow-xl border py-2 min-w-[180px] z-50">
+                    <div class="px-3 py-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'} border-b ${isDark ? 'border-gray-700' : ''}">主题颜色</div>
+                    ${themeOptions}
+                    <div class="border-t ${isDark ? 'border-gray-700' : ''} mt-1 pt-1">
+                      <button onclick="planner.toggleThemeMode()"
+                              class="flex items-center gap-3 px-4 py-2 w-full hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+                        ${isDark ? `
+                          <svg class="w-5 h-5 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
+                          </svg>
+                          <span class="${isDark ? 'text-gray-200' : ''}">浅色模式</span>
+                        ` : `
+                          <svg class="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
+                          </svg>
+                          <span>深色模式</span>
+                        `}
+                      </button>
+                    </div>
+                  </div>
+                ` : ''}
+              </div>
+              <div class="relative">
+                <button onclick="event.stopPropagation(); planner.toggleMoreMenu()"
+                        class="p-2 ${isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-white hover:bg-gray-100'} rounded-lg transition-colors shadow-md"
+                        title="更多功能"
+                        id="moreMenuBtn">
+                  <svg class="w-5 h-5 ${isDark ? 'text-gray-200' : 'text-gray-700'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"/>
+                  </svg>
+                </button>
+              </div>
+              <button onclick="event.stopPropagation(); planner.toggleQuadrantView()"
+                      class="px-4 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors shadow-md text-sm font-medium">
+                四象限
+              </button>
+              <button onclick="event.stopPropagation(); planner.toggleStatsModal()"
+                      class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors shadow-md text-sm font-medium">
+                统计
+              </button>
+              <button onclick="event.stopPropagation(); planner.openRecurringScheduleModal()"
+                      class="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors shadow-md text-sm font-medium flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+                循环
+              </button>
+            </div>
+          </div>
+          ${this.viewMode === 'month' ? this.generateCalendarHTML() : this.generateWeekViewHTML()}
+          
+          <!-- 周月年总结入口 -->
+          ${this.generateSummaryButtonsHTML()}
+        </div>
+      </div>
+      ${this.generateTaskPanelHTML()}
+      ${this.generateCopyModalHTML()}
+      ${this.generateQuadrantViewHTML()}
+      ${this.generateStatsModalHTML()}
+      ${this.generateSearchPanelHTML()}
+      ${this.generateMoreMenuHTML()}
+      ${this.generateYearlyStatsHTML()}
+      ${this.generateWeeklySummaryHTML()}
+      ${this.generateMonthlySummaryHTML()}
+      ${this.generateAnniversaryModalHTML()}
+      ${this.generateReminderSettingsHTML()}
+      ${this.generateTagManagerHTML()}
+      ${this.generateQuickTagSelectorHTML()}
+      ${this.generateUpdateModalHTML()}
+      ${this.generateShortcutHelpHTML()}
+      ${this.generateContactInfoHTML()}
+      ${this.generateRecurringScheduleModalHTML()}
+      ${this.generateMemoPanelHTML()}
+      ${this.generateKnowledgeBaseHTML()}
+      ${this.generateSaveStatusHTML()}
+    `;
+
+    // 使用 requestAnimationFrame 确保 DOM 渲染完成后再添加动画类
+    requestAnimationFrame(() => {
+      // 任务面板动画 - 只在没有弹窗打开时显示
+      const taskPanel = document.querySelector('.task-panel');
+      const hasOpenModal = this.showStatsModal || this.showCopyModal || this.showThemeMenu || this.showNotificationPanel || this.showMoreMenu;
+
+      // 任务面板状态没变时不需要处理动画
+      // 只在首次打开时添加show类
+
+      // 统计弹窗动画
+      const statsModal = document.querySelector('.stats-modal');
+      const modalBackdrop = document.querySelector('.modal-backdrop');
+      if (this.showStatsModal) {
+        if (statsModal) statsModal.classList.add('show');
+        if (modalBackdrop) modalBackdrop.classList.add('show');
+      }
+    });
+  }
+}
+
+export function initApp(): void {
+  const plannerInstance = new DailyPlanner();
+  (window as any).planner = plannerInstance;
+  
+  // 键盘快捷键
+  document.addEventListener('keydown', (e: KeyboardEvent) => {
+    const planner = (window as any).planner;
+    if (!planner) return;
+    
+    // 如果正在输入框中，不处理快捷键（除了 Escape）
+    const activeElement = document.activeElement;
+    const isInputFocused = activeElement?.tagName === 'INPUT' || activeElement?.tagName === 'TEXTAREA' || activeElement?.tagName === 'SELECT';
+    
+    // Escape - 关闭面板/弹窗
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      // 直接调用关闭逻辑
+      planner.showStatsModal = false;
+      planner.showCopyModal = false;
+      planner.copyingTask = null;
+      planner.selectedCopyDates = new Set();
+      planner.showThemeMenu = false;
+      planner.showSearchPanel = false;
+      planner.searchQuery = '';
+      planner.showYearlyStats = false;
+      planner.showAnniversaryModal = false;
+      planner.showMoreMenu = false;
+      if (planner.selectedDate) {
+        planner.selectedDate = null;
+        planner.hoveredDate = null;
+      }
+      planner.render();
+      return;
+    }
+    
+    // 如果在输入框中，不处理其他快捷键
+    if (isInputFocused) return;
+    
+    // Enter - 聚焦到任务输入框
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const taskInput = document.getElementById('taskInput') as HTMLInputElement;
+      if (taskInput) {
+        taskInput.focus();
+        taskInput.select();
+      }
+      return;
+    }
+    
+    // 方向键 - 导航日期
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      if (planner.viewMode === 'month') {
+        if (planner.selectedDate) {
+          const newDate = new Date(planner.selectedDate);
+          newDate.setDate(newDate.getDate() - 1);
+          planner.selectDate(newDate);
+          if (newDate.getMonth() !== planner.currentDate.getMonth()) {
+            planner.currentDate = new Date(newDate.getFullYear(), newDate.getMonth(), 1);
+          }
+        } else {
+          const today = new Date();
+          planner.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+          planner.selectedDate = new Date(today);
+          planner.hoveredDate = null;
+          planner.loadHolidaysForYear(today.getFullYear());
+        }
+      } else {
+        planner.currentDate.setDate(planner.currentDate.getDate() - 1);
+      }
+      planner.render();
+      return;
+    }
+    
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (planner.viewMode === 'month') {
+        if (planner.selectedDate) {
+          const newDate = new Date(planner.selectedDate);
+          newDate.setDate(newDate.getDate() + 1);
+          planner.selectDate(newDate);
+          if (newDate.getMonth() !== planner.currentDate.getMonth()) {
+            planner.currentDate = new Date(newDate.getFullYear(), newDate.getMonth(), 1);
+          }
+        } else {
+          const today = new Date();
+          planner.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+          planner.selectedDate = new Date(today);
+          planner.hoveredDate = null;
+          planner.loadHolidaysForYear(today.getFullYear());
+        }
+      } else {
+        planner.currentDate.setDate(planner.currentDate.getDate() + 1);
+      }
+      planner.render();
+      return;
+    }
+    
+    // 上键 - 向前7天（上周）
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (planner.viewMode === 'month') {
+        if (planner.selectedDate) {
+          const newDate = new Date(planner.selectedDate);
+          newDate.setDate(newDate.getDate() - 7);
+          planner.selectDate(newDate);
+          if (newDate.getMonth() !== planner.currentDate.getMonth()) {
+            planner.currentDate = new Date(newDate.getFullYear(), newDate.getMonth(), 1);
+            planner.loadHolidaysForYear(newDate.getFullYear());
+          }
+        } else {
+          const today = new Date();
+          planner.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+          planner.selectedDate = new Date(today);
+          planner.hoveredDate = null;
+          planner.loadHolidaysForYear(today.getFullYear());
+        }
+      } else if (planner.viewMode === 'week') {
+        planner.currentDate.setDate(planner.currentDate.getDate() - 7);
+      } else {
+        planner.currentDate.setDate(planner.currentDate.getDate() - 7);
+      }
+      planner.render();
+      return;
+    }
+    
+    // 下键 - 向后7天（下周）
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (planner.viewMode === 'month') {
+        if (planner.selectedDate) {
+          const newDate = new Date(planner.selectedDate);
+          newDate.setDate(newDate.getDate() + 7);
+          planner.selectDate(newDate);
+          if (newDate.getMonth() !== planner.currentDate.getMonth()) {
+            planner.currentDate = new Date(newDate.getFullYear(), newDate.getMonth(), 1);
+            planner.loadHolidaysForYear(newDate.getFullYear());
+          }
+        } else {
+          const today = new Date();
+          planner.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+          planner.selectedDate = new Date(today);
+          planner.hoveredDate = null;
+          planner.loadHolidaysForYear(today.getFullYear());
+        }
+      } else if (planner.viewMode === 'week') {
+        planner.currentDate.setDate(planner.currentDate.getDate() + 7);
+      } else {
+        planner.currentDate.setDate(planner.currentDate.getDate() + 7);
+      }
+      planner.render();
+      return;
+    }
+    
+    // T - 跳转到今天
+    if (e.key === 't' || e.key === 'T') {
+      e.preventDefault();
+      const today = new Date();
+      // 根据视图模式设置 currentDate
+      if (planner.viewMode === 'month') {
+        planner.currentDate = new Date(today.getFullYear(), today.getMonth(), 1);
+      } else {
+        // 周视图：设置为今天
+        planner.currentDate = new Date(today);
+      }
+      planner.selectedDate = new Date(today);
+      planner.hoveredDate = null;
+      planner.loadHolidaysForYear(today.getFullYear());
+      planner.render();
+      return;
+    }
+    
+    // / - 打开搜索
+    if (e.key === '/') {
+      e.preventDefault();
+      planner.showSearchPanel = true;
+      planner.render();
+      setTimeout(() => {
+        const searchInput = document.querySelector('[placeholder="搜索任务..."]') as HTMLInputElement;
+        if (searchInput) searchInput.focus();
+      }, 100);
+      return;
+    }
+  });
+}
