@@ -6,6 +6,9 @@ on:
       - 'v*' # 当推送 v 开头的 tag 时触发，如 v1.0.0
   workflow_dispatch: # 也支持手动触发
 
+permissions:
+  contents: write # 创建 Release 与上传安装包需要写权限
+
 jobs:
   # 构建 Windows 安装包并上传到 GitHub Release
   build:
@@ -39,7 +42,7 @@ jobs:
         run: pnpm build
 
       - name: Build Electron app
-        run: pnpm electron:build
+        run: pnpm electron:build -- --publish never # 只构建不发布，Release 由下方步骤统一创建
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
